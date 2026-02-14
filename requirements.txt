@@ -3,3 +3,5 @@ matplotlib
 safetensors
 torch
 huggingface_hub
+transformers
+tqdm

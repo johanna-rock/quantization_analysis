@@ -1,0 +1,264 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import os
+import sys
+from dataclasses import dataclass
+
+import numpy as np
+
+from hf_model_utils import build_model_index, resolve_format_list, resolve_selected_tensors, load_tensor_fp32
+from quantization_formats import SUPPORTED_FORMATS, quantize_weight_values
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="wq",
+        description="Weight quantization analyzer for Hugging Face checkpoints.",
+    )
+    parser.add_argument("repo_or_url", help="Hugging Face model repo/URL.")
+    parser.add_argument(
+        "filter_query",
+        nargs="*",
+        help="Optional filter: substring, or dotted torch-style prefix path.",
+    )
+    parser.add_argument("--revision", default="main", help="Hugging Face revision (default: main).")
+    parser.add_argument(
+        "--cache-dir",
+        default="data/hf-cache",
+        help="Shared local cache for downloaded/dequantized tensors (default: data/hf-cache).",
+    )
+    parser.add_argument(
+        "-c",
+        "--compress",
+        action="append",
+        metavar="FORMAT",
+        help="Quantization formats to evaluate: mxfp4, nvfp4, bf16, bfp8, bfp4, bfp2, fp0, or all.",
+    )
+    parser.add_argument("--limit", type=int, default=None, help="Optional max matched tensors.")
+    parser.add_argument(
+        "--backend",
+        choices=["emulation", "ttnn"],
+        default="emulation",
+        help="Quantization backend for BFP formats (default: emulation).",
+    )
+    return parser.parse_args()
+
+
+def _pearson_corr(a: np.ndarray, b: np.ndarray) -> float:
+    a = np.asarray(a, dtype=np.float32).reshape(-1)
+    b = np.asarray(b, dtype=np.float32).reshape(-1)
+    if a.size == 0:
+        return 1.0
+    am = a - np.mean(a)
+    bm = b - np.mean(b)
+    denom = float(np.linalg.norm(am) * np.linalg.norm(bm))
+    if denom == 0.0:
+        return 1.0 if np.max(np.abs(a - b)) == 0.0 else 0.0
+    return float(np.dot(am, bm) / denom)
+
+
+def _tensor_meta_str(x: np.ndarray) -> str:
+    x = np.asarray(x, dtype=np.float32)
+    return f"shape={tuple(x.shape)} min={np.min(x):.3e} mean={np.mean(x):.3e} max={np.max(x):.3e}"
+
+
+COLOR_ENABLED = sys.stdout.isatty() and os.getenv("TERM", "") != "dumb" and not os.getenv("NO_COLOR")
+COLORS = {
+    "reset": "\033[0m",
+    "title": "\033[1;37m",
+    "muted": "\033[90m",
+    "good": "\033[92m",
+    "mid": "\033[93m",
+    "bad": "\033[91m",
+    "cyan": "\033[96m",
+}
+
+
+def paint(text: str, color: str) -> str:
+    if not COLOR_ENABLED:
+        return text
+    return f"{COLORS[color]}{text}{COLORS['reset']}"
+
+
+def color_pcc(v: float) -> str:
+    if v >= 0.999:
+        return "good"
+    if v >= 0.99:
+        return "mid"
+    return "bad"
+
+
+def color_err(v: float) -> str:
+    if v <= 1e-4:
+        return "good"
+    if v <= 1e-3:
+        return "mid"
+    return "bad"
+
+
+@dataclass
+class Row:
+    fmt: str
+    pcc: float
+    mae: float
+    atol: float
+
+
+def _import_ttnn_quiet():
+    os.environ.setdefault("LOGURU_LEVEL", "ERROR")
+    os.environ.setdefault("TTNN_LOG_LEVEL", "ERROR")
+    os.environ.setdefault("TT_METAL_LOGGER_LEVEL", "ERROR")
+    try:
+        import ttnn  # pylint: disable=import-outside-toplevel
+    except ModuleNotFoundError as exc:
+        raise RuntimeError("TTNN backend requires `ttnn` in the active Python environment.") from exc
+    return ttnn
+
+
+def _quantize_with_backend(xf: np.ndarray, fmt: str, backend: str, ttnn=None) -> np.ndarray:
+    fmt_l = fmt.lower()
+    if backend == "ttnn" and fmt_l in {"bfp8", "bfp4", "bfp2"}:
+        import torch
+
+        dtype_attr_map = {
+            "bfp8": "bfloat8_b",
+            "bfp4": "bfloat4_b",
+            "bfp2": "bfloat2_b",
+        }
+        attr = dtype_attr_map[fmt_l]
+        if ttnn is None:
+            raise RuntimeError("Internal error: TTNN backend selected but ttnn is not initialized.")
+        if not hasattr(ttnn, attr):
+            raise RuntimeError(f"Active ttnn does not support format '{fmt_l}' (missing {attr}).")
+        tt_dtype = getattr(ttnn, attr)
+        x_t = torch.from_numpy(np.asarray(xf, dtype=np.float32))
+        tt_tensor = ttnn.from_torch(x_t, dtype=tt_dtype, layout=ttnn.TILE_LAYOUT)
+        y_t = ttnn.to_torch(tt_tensor).to(dtype=torch.float32).cpu()
+        return y_t.numpy()
+
+    return quantize_weight_values(xf, fmt_l)
+
+
+def _build_hierarchy(tensor_names: list[str]) -> dict:
+    root: dict = {}
+    for name in sorted(tensor_names):
+        node = root
+        for part in name.split("."):
+            node = node.setdefault(part, {})
+    return root
+
+
+def _count_leaves(node: dict) -> int:
+    if not node:
+        return 1
+    return sum(_count_leaves(child) for child in node.values())
+
+
+def _render_hierarchy_lines(node: dict, prefix: str = "") -> list[str]:
+    lines: list[str] = []
+    items = sorted(node.items(), key=lambda kv: kv[0])
+    for i, (name, child) in enumerate(items):
+        is_last = i == len(items) - 1
+        branch = "└── " if is_last else "├── "
+        count = _count_leaves(child)
+        label = f"{name} {paint(f'({count})', 'muted') if count > 1 else ''}".rstrip()
+        lines.append(f"{prefix}{branch}{label}")
+        if child:
+            ext = "    " if is_last else "│   "
+            lines.extend(_render_hierarchy_lines(child, prefix + ext))
+    return lines
+
+
+def _print_hierarchy(tensor_names: list[str]) -> None:
+    tree = _build_hierarchy(tensor_names)
+    print(paint("Hierarchy", "title"))
+    for line in _render_hierarchy_lines(tree):
+        print(f"  {paint(line, 'muted')}")
+    print()
+
+
+def run() -> int:
+    args = parse_args()
+    filter_query = " ".join(args.filter_query).strip() or None
+    formats = resolve_format_list(args.compress, SUPPORTED_FORMATS)
+
+    index = build_model_index(repo_or_url=args.repo_or_url, revision=args.revision, cache_dir=args.cache_dir)
+    tensor_names = resolve_selected_tensors(index, filter_query)
+    if args.limit is not None:
+        tensor_names = tensor_names[: max(0, args.limit)]
+    if not tensor_names:
+        print("No tensors matched.", file=sys.stderr)
+        return 1
+
+    ttnn = None
+    if args.backend == "ttnn":
+        try:
+            ttnn = _import_ttnn_quiet()
+        except Exception as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+
+    print(
+        f"{paint(index.repo_id, 'title')} {paint('@', 'muted')}{paint(index.revision, 'cyan')} "
+        f"{paint('-', 'muted')} {paint(str(len(tensor_names)), 'title')} {paint('tensors', 'muted')}"
+    )
+    print(f"{paint('formats:', 'muted')} {', '.join(formats)}")
+    print(f"{paint('backend:', 'muted')} {args.backend}")
+    print()
+    _print_hierarchy(tensor_names)
+
+    aggregate: dict[str, list[Row]] = {fmt: [] for fmt in formats}
+
+    for tensor_name in tensor_names:
+        x = load_tensor_fp32(index, tensor_name)
+        xf = np.asarray(x, dtype=np.float32)
+        print(paint(tensor_name, "title"))
+        print(f"  {paint(_tensor_meta_str(xf), 'muted')}")
+
+        rows: list[Row] = []
+        for fmt in formats:
+            y = _quantize_with_backend(xf=xf, fmt=fmt, backend=args.backend, ttnn=ttnn)
+            diff = np.abs(xf - y)
+            mae = float(np.mean(diff))
+            atol = float(np.max(diff))
+            pcc = _pearson_corr(xf, y)
+            row = Row(fmt=fmt.upper(), pcc=pcc, mae=mae, atol=atol)
+            rows.append(row)
+            aggregate[fmt].append(row)
+
+        fmt_w = max(len(r.fmt) for r in rows)
+        print(f"  {paint('FORMAT'.ljust(fmt_w), 'muted')}  {paint('PCC', 'muted')}      {paint('MAE', 'muted')}      {paint('ATOL', 'muted')}")
+        for r in rows:
+            pcc_txt = f"{r.pcc: .5f}"
+            mae_txt = f"{r.mae:.3e}"
+            atol_txt = f"{r.atol:.3e}"
+            print(
+                f"  {r.fmt.ljust(fmt_w)}  "
+                f"{paint(pcc_txt, color_pcc(r.pcc))}  "
+                f"{paint(mae_txt, color_err(r.mae))}  "
+                f"{paint(atol_txt, color_err(r.atol))}"
+            )
+        print()
+
+    print(paint("Summary (mean across matched tensors)", "title"))
+    for fmt in formats:
+        rows = aggregate[fmt]
+        if not rows:
+            continue
+        pcc = float(np.mean([r.pcc for r in rows]))
+        mae = float(np.mean([r.mae for r in rows]))
+        atol = float(np.mean([r.atol for r in rows]))
+        print(
+            f"  {fmt.upper():>5}  "
+            f"pcc={paint(f'{pcc: .5f}', color_pcc(pcc))}  "
+            f"mae={paint(f'{mae:.3e}', color_err(mae))}  "
+            f"atol={paint(f'{atol:.3e}', color_err(atol))}"
+        )
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(run())

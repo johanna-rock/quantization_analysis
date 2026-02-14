@@ -1,18 +1,22 @@
 # quantization-plots
 
-Small research scripts for visualizing low-precision quantization behavior, with optional DeepSeek-R1 weight-driven curves.
+Quantization visualization tools for any Hugging Face model repo with `.safetensors` weights.
 
-## What this repo contains
+## Scripts
 
-- `quantization_plot.py`: plots `amax -> reconstructed value` staircase curves for:
-  - `MXFP4`, `NVFP4`, `BF16`
-  - `BFP8`, `BFP4`, `BFP2` (ideal exponent and rand16 exponent modes)
-  - optional DeepSeek-based BFP4 curves from selected tensors
-- `quantization_error_weights.py`: plots per-tensor quantization transfer curves over each tensor’s real value range (`min(weight)` to `max(weight)`) for:
-  - `Ideal`, `BF16`, `BFP8`, `BFP4`, `BFP2`, `FP0`
-  - writes one plot image per tensor
-- `download_deepseek_weights.py`: downloads required DeepSeek shards for tensors in `ds_tensors.txt` and can build a local dequantized fp32 safetensors file
-- `ds_tensors.txt`: list of DeepSeek tensor names to include (`tensor_name | Label` format)
+- `compare_reconstr_error_synth_data.py`
+  - Plots `amax -> reconstructed value` staircase curves.
+  - Includes synthetic curves only (`BF16`, `BFP8`, `BFP4`, `BFP2`, `FP0`).
+- `compare_reconstr_error_weights.py`
+  - Plots one figure per matched tensor over that tensor's real min/max range.
+  - Compares `Ideal` vs quantized reconstructions (`BF16`, `BFP8`, `BFP4`, `BFP2`, `FP0`).
+- `wq`
+  - wa-like quantization analyzer for matched tensors.
+  - Reports per-format `pcc`, `mae`, and `atol` using the same emulation as the plotting scripts.
+- `quantization_formats.py`
+  - Shared quantization format definitions/emulation used by all quantization scripts.
+- `wa`
+  - Tensor explorer used as CLI style inspiration.
 
 ## Setup
 
@@ -23,73 +27,101 @@ pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
-## Usage
+Optional:
+- `wq --backend ttnn` requires a separate `ttnn` install from Tenstorrent tooling; it is intentionally not in `requirements.txt`.
 
-### 0) Reproducible data bootstrap (if `data/` is missing)
-
-Set your HF token if needed (recommended for higher rate limits):
+Optional for higher HF rate limits:
 
 ```bash
 export HF_TOKEN=your_token_here
 ```
 
-Download the required DeepSeek shards and build
-`data/deepseek-r1/deepseek-r1-layer0-fp32.safetensors`
+## CLI Pattern
+
+`compare_reconstr_error_weights.py`:
 
 ```bash
-python download_deepseek_weights.py \
-  --cache-dir data/deepseek-r1 \
-  --tensors-file ds_tensors.txt \
-  --output-fp32-file data/deepseek-r1/deepseek-r1-layer0-fp32.safetensors
+[repo_or_url] [filter_query] [--revision REVISION] [-c FORMAT]
 ```
 
-If you only want to download shards (skip local fp32 file creation):
+- `repo_or_url`: HF repo id or HF model URL.
+- `filter_query`: optional tensor filter.
+  - Dotted query (example: `model.layers.0`) = torch-style prefix match.
+  - Non-dotted query (example: `q_proj`) = substring match.
+- `--revision`: HF revision (default `main`).
+- `-c FORMAT`: repeatable format selector; use `-c all` for all supported formats.
+
+`compare_reconstr_error_synth_data.py`:
 
 ```bash
-python download_deepseek_weights.py \
-  --cache-dir data/deepseek-r1 \
-  --tensors-file ds_tensors.txt \
-  --no-build-fp32
+[-c FORMAT] [--rand-samples N]
 ```
+
+`wq`:
+
+```bash
+[repo_or_url] [filter_query] [--revision REVISION] [-c FORMAT]
+```
+
+## Usage
 
 ### 1) Amax reconstruction plot
 
 ```bash
-python quantization_plot.py \
-  --ds-weights-path data/deepseek-r1/deepseek-r1-layer0-fp32.safetensors \
-  --ds-tensors-file ds_tensors.txt
+python compare_reconstr_error_synth_data.py -c all --rand-samples 100
+```
+
+### 2) Per-weight-range plots
+
+```bash
+python compare_reconstr_error_weights.py deepseek-ai/DeepSeek-R1 model.layers.0.self_attn --revision main -c all
+```
+
+Write PNGs to a custom folder:
+
+```bash
+python compare_reconstr_error_weights.py deepseek-ai/DeepSeek-R1 model.layers.0.self_attn \
+  --revision main -c all --out-dir plots/visualize_quantization_error
+```
+
+Show interactively:
+
+```bash
+python compare_reconstr_error_weights.py deepseek-ai/DeepSeek-R1 model.layers.0.self_attn \
+  --revision main -c all --show
+```
+
+### 3) wa-like quantization report
+
+```bash
+python ./wq deepseek-ai/DeepSeek-R1 model.layers.0.self_attn --revision main -c all --limit 5
+```
+
+Use emulation backend (default):
+
+```bash
+python ./wq deepseek-ai/DeepSeek-R1 model.layers.0.self_attn --revision main -c bfp8 -c bfp4 -c bfp2 --backend emulation
+```
+
+Use TTNN roundtrip backend for BFP formats:
+
+```bash
+python ./wq deepseek-ai/DeepSeek-R1 model.layers.0.self_attn --revision main -c bfp8 -c bfp4 -c bfp2 --backend ttnn
 ```
 
 Notes:
-- If a requested `*_fp32` tensor is not present in the local file, the script falls back to loading base tensor + `*_scale_inv` from DeepSeek shards and dequantizes automatically.
-- You can toggle lines in the plot via the checkbox panel.
+- `--backend ttnn` requires `ttnn` in the active Python environment.
+- With `--backend ttnn`, only `bfp8`, `bfp4`, and `bfp2` use TTNN conversion; other formats still use emulation.
 
-### 2) Per-weight-range error plots (one output file per tensor)
-
-```bash
-python quantization_error_weights.py \
-  --ds-weights-path data/deepseek-r1/deepseek-r1-layer0-fp32.safetensors \
-  --ds-tensors-file ds_tensors.txt \
-  --out-dir plots/quantization_error_weights
-```
-
-Optional interactive display:
+Open all generated PNGs on macOS:
 
 ```bash
-python quantization_error_weights.py \
-  --ds-weights-path data/deepseek-r1/deepseek-r1-layer0-fp32.safetensors \
-  --ds-tensors-file ds_tensors.txt \
-  --out-dir plots/quantization_error_weights \
-  --show
+open plots/visualize_quantization_error/*.png
 ```
 
-To open all generated plots on macOS:
+## Notes
 
-```bash
-open plots/quantization_error_weights/*.png
-```
-
-## Data assumptions
-
-- Local cache/data is expected under `data/deepseek-r1/` (or set your own path with `--ds-weights-path`).
-- `ds_tensors.txt` should include tensor names that exist in the selected model files/index.
+- The loader supports indexed and non-indexed safetensors repos.
+- If a tensor has a matching `*_scale_inv`, the loader dequantizes to fp32 automatically.
+- All scripts share the same default cache root: `data/hf-cache`.
+- Downloaded model shards and dequantized fp32 tensors are reused across scripts.
