@@ -6,13 +6,20 @@ Synthetic amax -> reconstructed-value staircase plots for quantization formats.
 from __future__ import annotations
 
 import argparse
+import os
 
+import matplotlib
 import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.widgets import CheckButtons
 
 from hf_model_utils import resolve_format_list
-from quantization_formats import SUPPORTED_FORMATS, make_synth_curves
+from quantization_formats import (
+    SUPPORTED_FORMATS,
+    make_synth_curves,
+    quantize_dequantize_bfp_ideal,
+    simulate_bfp_ttnn_rand_row,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -33,6 +40,17 @@ def parse_args() -> argparse.Namespace:
         default=100,
         help="Number of random blocks to average for BFP rand curves (default: 100).",
     )
+    parser.add_argument(
+        "--out",
+        type=str,
+        default=None,
+        help="Optional output path to save the plot as a PNG.",
+    )
+    parser.add_argument(
+        "--no-show",
+        action="store_true",
+        help="Do not open an interactive window (useful for headless runs).",
+    )
     return parser.parse_args()
 
 
@@ -42,6 +60,27 @@ def main() -> None:
 
     xs = np.linspace(0.0, 1.0, 400, dtype=np.float32)
     curves = make_synth_curves(xs=xs, formats=formats, rand_samples=args.rand_samples)
+    if "bfp8" in formats:
+        curves["bfp8_ideal"] = quantize_dequantize_bfp_ideal(xs, mant_bits=7)
+        rng = np.random.default_rng(0)
+        curves["bfp8_rand"] = np.array(
+            [simulate_bfp_ttnn_rand_row(float(x), 7, rand_samples=args.rand_samples, rng=rng) for x in xs],
+            dtype=np.float32,
+        )
+    if "bfp4" in formats:
+        curves["bfp4_ideal"] = quantize_dequantize_bfp_ideal(xs, mant_bits=3)
+        rng = np.random.default_rng(0)
+        curves["bfp4_rand"] = np.array(
+            [simulate_bfp_ttnn_rand_row(float(x), 3, rand_samples=args.rand_samples, rng=rng) for x in xs],
+            dtype=np.float32,
+        )
+    if "bfp2" in formats:
+        curves["bfp2_ideal"] = quantize_dequantize_bfp_ideal(xs, mant_bits=1)
+        rng = np.random.default_rng(0)
+        curves["bfp2_rand"] = np.array(
+            [simulate_bfp_ttnn_rand_row(float(x), 1, rand_samples=args.rand_samples, rng=rng) for x in xs],
+            dtype=np.float32,
+        )
 
     fig, ax = plt.subplots(figsize=(11, 5.5))
     lines = []
@@ -96,7 +135,19 @@ def main() -> None:
     check.on_clicked(_toggle)
     _refresh_legend()
     plt.tight_layout(rect=[0.0, 0.0, 0.8, 1.0])
-    plt.show()
+
+    headless = not os.environ.get("DISPLAY")
+    out_path = args.out
+    if out_path is None and (headless or args.no_show):
+        out_path = os.path.join("plots", "compare_reconstr_error_synth_data.png")
+
+    if out_path is not None:
+        os.makedirs(os.path.dirname(out_path), exist_ok=True)
+        plt.savefig(out_path, dpi=200)
+        print(f"Saved plot to {out_path}")
+
+    if not headless and not args.no_show:
+        plt.show()
 
 
 if __name__ == "__main__":

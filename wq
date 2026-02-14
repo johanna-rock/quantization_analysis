@@ -119,7 +119,7 @@ def _import_ttnn_quiet():
 
 def _quantize_with_backend(xf: np.ndarray, fmt: str, backend: str, ttnn=None) -> np.ndarray:
     fmt_l = fmt.lower()
-    if backend == "ttnn" and fmt_l in {"bfp8", "bfp4", "bfp2"}:
+    if backend == "ttnn" and fmt_l in {"bfp8", "bfp4"}:
         import torch
 
         dtype_attr_map = {

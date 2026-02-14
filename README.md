@@ -7,6 +7,7 @@ Quantization visualization tools for any Hugging Face model repo with `.safetens
 - `compare_reconstr_error_synth_data.py`
   - Plots `amax -> reconstructed value` staircase curves.
   - Includes synthetic curves only (`BF16`, `BFP8`, `BFP4`, `BFP2`, `FP0`).
+  - BFP “ideal” curves use per-element exponents; BFP “rand” curves use TTNN-style shared-exponent rows.
 - `compare_reconstr_error_weights.py`
   - Plots one figure per matched tensor over that tensor's real min/max range.
   - Compares `Ideal` vs quantized reconstructions (`BF16`, `BFP8`, `BFP4`, `BFP2`, `FP0`).
@@ -15,6 +16,7 @@ Quantization visualization tools for any Hugging Face model repo with `.safetens
   - Reports per-format `pcc`, `mae`, and `atol` using the same emulation as the plotting scripts.
 - `quantization_formats.py`
   - Shared quantization format definitions/emulation used by all quantization scripts.
+  - BFP emulation matches TTNN packing (shared exponent per 16-element row in 32x32 tiles).
 - `wa`
   - Tensor explorer used as CLI style inspiration.
 
@@ -54,7 +56,7 @@ export HF_TOKEN=your_token_here
 `compare_reconstr_error_synth_data.py`:
 
 ```bash
-[-c FORMAT] [--rand-samples N]
+[-c FORMAT] [--rand-samples N] [--out PATH] [--no-show]
 ```
 
 `wq`:
@@ -71,16 +73,22 @@ export HF_TOKEN=your_token_here
 python compare_reconstr_error_synth_data.py -c all --rand-samples 100
 ```
 
+Headless (save PNG instead of showing a window):
+
+```bash
+python compare_reconstr_error_synth_data.py -c all --rand-samples 100 --out plots/compare_reconstr_error_synth_data.png --no-show
+```
+
 ### 2) Per-weight-range plots
 
 ```bash
-python compare_reconstr_error_weights.py deepseek-ai/DeepSeek-R1 model.layers.0.self_attn --revision main -c all
+python compare_reconstr_error_weights.py deepseek-ai/DeepSeek-R1 model.layers.0.self_attn.kv_a_layernorm.weight -c all
 ```
 
 Write PNGs to a custom folder:
 
 ```bash
-python compare_reconstr_error_weights.py deepseek-ai/DeepSeek-R1 model.layers.0.self_attn \
+python compare_reconstr_error_weights.py deepseek-ai/DeepSeek-R1 model.layers.0.self_attn.kv_a_layernorm.weight \
   --revision main -c all --out-dir plots/visualize_quantization_error
 ```
 
@@ -88,30 +96,30 @@ Show interactively:
 
 ```bash
 python compare_reconstr_error_weights.py deepseek-ai/DeepSeek-R1 model.layers.0.self_attn \
-  --revision main -c all --show
+  -c all --show
 ```
 
-### 3) wa-like quantization report
+### 3) CLI Quantization report
 
 ```bash
-python ./wq deepseek-ai/DeepSeek-R1 model.layers.0.self_attn --revision main -c all --limit 5
+python ./wq deepseek-ai/DeepSeek-R1 model.layers.0.self_attn -c all --limit 10
 ```
 
 Use emulation backend (default):
 
 ```bash
-python ./wq deepseek-ai/DeepSeek-R1 model.layers.0.self_attn --revision main -c bfp8 -c bfp4 -c bfp2 --backend emulation
+python ./wq deepseek-ai/DeepSeek-R1 model.layers.0.self_attn -c bfp8 -c bfp4 -c bfp2 --backend emulation
 ```
 
 Use TTNN roundtrip backend for BFP formats:
 
 ```bash
-python ./wq deepseek-ai/DeepSeek-R1 model.layers.0.self_attn --revision main -c bfp8 -c bfp4 -c bfp2 --backend ttnn
+python ./wq deepseek-ai/DeepSeek-R1 model.layers.0.self_attn -c bfp8 -c bfp4 -c bfp2 --backend ttnn
 ```
 
 Notes:
 - `--backend ttnn` requires `ttnn` in the active Python environment.
-- With `--backend ttnn`, only `bfp8`, `bfp4`, and `bfp2` use TTNN conversion; other formats still use emulation.
+- With `--backend ttnn`, only `bfp8` and `bfp4` use TTNN conversion. `bfp2` and other formats still use emulation.
 
 Open all generated PNGs on macOS:
 

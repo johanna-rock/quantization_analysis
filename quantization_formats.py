@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import numpy as np
+from functools import lru_cache
 
 
 SUPPORTED_FORMATS = ["mxfp4", "nvfp4", "bf16", "bfp8", "bfp4", "bfp2", "fp0"]
@@ -63,6 +64,106 @@ def quantize_dequantize_bfp_ideal(x: np.ndarray, mant_bits: int) -> np.ndarray:
     return np.sign(x) * out
 
 
+def _ceil_div(a: int, b: int) -> int:
+    return (a + b - 1) // b
+
+
+@lru_cache(maxsize=None)
+def _ttnn_bfp_decode_table(mant_bits: int) -> tuple[np.ndarray, np.ndarray]:
+    mask = (1 << mant_bits) - 1
+    shift_cnt = np.zeros(mask + 1, dtype=np.uint32)
+    man_shifted = np.zeros(mask + 1, dtype=np.uint32)
+    for man in range(1, mask + 1):
+        msb_pos = int(np.floor(np.log2(man)))
+        shift = (mant_bits - 1) - msb_pos
+        shift_cnt[man] = shift
+        man_shifted[man] = (man << (shift + 1)) & mask
+    return shift_cnt, man_shifted
+
+
+def quantize_dequantize_bfp_ttnn(x: np.ndarray, mant_bits: int) -> np.ndarray:
+    x = np.asarray(x, dtype=np.float32)
+    if x.size == 0:
+        return x.astype(np.float32)
+
+    orig_shape = x.shape
+    if x.ndim == 0:
+        batch, height, width = 1, 1, 1
+        x = x.reshape(batch, height, width)
+    elif x.ndim == 1:
+        batch, height, width = 1, 1, x.shape[0]
+        x = x.reshape(batch, height, width)
+    else:
+        height, width = x.shape[-2], x.shape[-1]
+        batch = int(np.prod(x.shape[:-2])) if x.ndim > 2 else 1
+        x = x.reshape(batch, height, width)
+
+    tile_h = 32
+    tile_w = 32
+    pad_h = _ceil_div(height, tile_h) * tile_h
+    pad_w = _ceil_div(width, tile_w) * tile_w
+
+    x_pad = np.zeros((batch, pad_h, pad_w), dtype=np.float32)
+    x_pad[:, :height, :width] = x
+
+    if pad_h == 0 or pad_w == 0:
+        return np.zeros(orig_shape, dtype=np.float32)
+
+    tiles_h = pad_h // tile_h
+    tiles_w = pad_w // tile_w
+
+    x_faces = x_pad.reshape(batch, tiles_h, 2, 16, tiles_w, 2, 16)
+    u32 = x_faces.view(np.uint32)
+
+    exp = (u32 >> 23) & 0xFF
+    shared_exp = exp.max(axis=-1, keepdims=True)
+
+    mantissa = u32 & 0x007FFFFF
+    sign = (u32 >> 31) & 0x1
+    zero_or_denorm = exp == 0
+
+    mantissa = (1 << 23) | mantissa
+    exp_diff = shared_exp.astype(np.uint32) - exp.astype(np.uint32)
+    while np.any(exp_diff > 31):
+        mask_big = exp_diff > 31
+        mantissa = np.where(mask_big, mantissa >> 31, mantissa)
+        exp_diff = np.where(mask_big, exp_diff - 31, exp_diff)
+    mantissa = mantissa >> exp_diff
+
+    shift = 24 - mant_bits
+    round_mask = (1 << shift) - 1
+    tie_value = 1 << (shift - 1)
+    round_value = mantissa & round_mask
+    mantissa = mantissa >> shift
+    guard_bit = mantissa & 0x1
+    round_up = (round_value > tie_value) | ((round_value == tie_value) & (guard_bit == 1))
+    mantissa = mantissa + round_up.astype(np.uint32)
+    mantissa = np.minimum(mantissa, (1 << mant_bits) - 1).astype(np.uint32)
+
+    sign = np.where(mantissa == 0, 0, sign)
+    code = (sign << mant_bits) | mantissa
+    code = np.where(zero_or_denorm, 0, code).astype(np.uint32)
+
+    mask = (1 << mant_bits) - 1
+    man = code & mask
+    sign = code >> mant_bits
+    shift_cnt_table, man_shifted_table = _ttnn_bfp_decode_table(mant_bits)
+    shift_cnt = shift_cnt_table[man]
+    man_shifted = man_shifted_table[man]
+
+    exp_out = shared_exp.astype(np.uint32) - shift_cnt.astype(np.uint32)
+    exp_out = np.where(man == 0, 0, exp_out).astype(np.uint32)
+
+    mant_shift = 23 - mant_bits
+    u32_out = (sign << 31) | (exp_out << 23) | (man_shifted << mant_shift)
+    y_pad = u32_out.view(np.float32).reshape(x_pad.shape)
+
+    y = y_pad[:, :height, :width]
+    if orig_shape == ():
+        return np.array(y[0, 0, 0], dtype=np.float32)
+    return y.reshape(orig_shape)
+
+
 def quantize_fp0(x: np.ndarray) -> np.ndarray:
     return np.zeros_like(np.asarray(x, dtype=np.float32), dtype=np.float32)
 
@@ -83,11 +184,11 @@ def quantize_weight_values(x: np.ndarray, fmt: str) -> np.ndarray:
     if fmt == "bf16":
         return quantize_dequantize_bf16(x)
     if fmt == "bfp8":
-        return quantize_dequantize_bfp_ideal(x, mant_bits=7)
+        return quantize_dequantize_bfp_ttnn(x, mant_bits=7)
     if fmt == "bfp4":
-        return quantize_dequantize_bfp_ideal(x, mant_bits=3)
+        return quantize_dequantize_bfp_ttnn(x, mant_bits=3)
     if fmt == "bfp2":
-        return quantize_dequantize_bfp_ideal(x, mant_bits=1)
+        return quantize_dequantize_bfp_ttnn(x, mant_bits=1)
     if fmt == "fp0":
         return quantize_fp0(x)
     raise ValueError(f"Unsupported weight format: {fmt}")
@@ -202,6 +303,28 @@ def simulate_bfp_amax(am: float, mant_bits: int, mode: str, rand_samples: int = 
             total += _reconstruct_with_amax(amax)
         return total / float(rand_samples)
     raise ValueError("mode must be 'ideal' or 'rand'")
+
+
+def simulate_bfp_ttnn_rand_row(
+    am: float,
+    mant_bits: int,
+    rand_samples: int = 100,
+    rng: np.random.Generator | None = None,
+    seed: int = 0,
+) -> float:
+    if rng is None:
+        rng = np.random.default_rng(seed)
+    am = float(abs(am))
+    if am == 0.0:
+        return 0.0
+    total = 0.0
+    for _ in range(rand_samples):
+        row = rng.random(16).astype(np.float32) * am
+        idx = int(rng.integers(0, 16))
+        row[idx] = am
+        y = quantize_dequantize_bfp_ttnn(row, mant_bits=mant_bits)
+        total += float(abs(y.reshape(-1)[idx]))
+    return total / float(rand_samples)
 
 
 def make_synth_curves(xs: np.ndarray, formats: list[str], rand_samples: int = 100) -> dict[str, np.ndarray]:
