@@ -1,0 +1,5 @@
+data/*
+plots/*
+.venv
+__pycache__/
+*.pyc

@@ -1,0 +1,25 @@
+# DeepSeek-R1 layer 0 tensors (uncomment to include in plot)
+# Format: tensor_name | Label
+# Note: this file expects *dequantized* tensor names (suffix _fp32).
+# Tensors without a corresponding `*_scale_inv` are not produced by the dequant script.
+
+# model.layers.0.input_layernorm.weight | (no scale_inv; not dequantized)
+# model.layers.0.mlp.down_proj.weight_fp32 | BFP4 DS mlp down
+# model.layers.0.mlp.gate_proj.weight_fp32 | BFP4 DS mlp gate (FF1)
+# model.layers.0.mlp.up_proj.weight_fp32 | BFP4 DS mlp up
+# model.layers.0.post_attention_layernorm.weight | (no scale_inv; not dequantized)
+# model.layers.0.self_attn.kv_a_layernorm.weight | (no scale_inv; not dequantized)
+# model.layers.0.self_attn.kv_a_proj_with_mqa.weight_fp32 | BFP4 DS kv_a_proj
+# model.layers.0.self_attn.kv_b_proj.weight_fp32 | BFP4 DS kv_b_proj
+# model.layers.0.self_attn.q_a_layernorm.weight | (no scale_inv; not dequantized)
+# model.layers.0.self_attn.q_a_proj.weight_fp32 | BFP4 DS Q Proj
+# model.layers.0.self_attn.q_b_proj.weight_fp32 | BFP4 DS q_b_proj
+
+model.layers.0.self_attn.q_a_proj.weight_fp32 | BFP4 DS Q Proj
+model.layers.0.self_attn.q_b_proj.weight_fp32 | BFP4 DS q_b_proj
+model.layers.0.self_attn.kv_a_proj_with_mqa.weight_fp32 | BFP4 DS kv_a_proj
+model.layers.0.self_attn.kv_b_proj.weight_fp32 | BFP4 DS kv_b_proj
+model.layers.0.self_attn.o_proj.weight_fp32 | BFP4 DS o_proj
+model.layers.0.mlp.down_proj.weight_fp32 | BFP4 DS mlp down
+model.layers.0.mlp.gate_proj.weight_fp32 | BFP4 DS mlp gate (FF1)
+model.layers.0.mlp.up_proj.weight_fp32 | BFP4 DS mlp up
