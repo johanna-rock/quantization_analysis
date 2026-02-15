@@ -1,0 +1,11 @@
+{
+  "algorithm": "transpose",
+  "quantization_formats": [
+    "bf16",
+    "bfp8",
+    "bfp4",
+    "bfp2",
+    "fp0"
+  ],
+  "params": {}
+}

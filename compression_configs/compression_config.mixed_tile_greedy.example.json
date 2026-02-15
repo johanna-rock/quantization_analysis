@@ -1,0 +1,16 @@
+{
+  "algorithm": "mixed-tile-greedy",
+  "quantization_formats": [
+    "bf16",
+    "bfp8",
+    "bfp4",
+    "bfp2",
+    "fp0"
+  ],
+  "params": {
+    "metric": "pcc",
+    "threshold": 0.999,
+    "cluster": "kmeans",
+    "k": 100
+  }
+}

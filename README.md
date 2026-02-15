@@ -43,7 +43,7 @@ export HF_TOKEN=your_token_here
 `compare_reconstr_error_weights.py`:
 
 ```bash
-[repo_or_url] [filter_query] [--revision REVISION] [-c FORMAT]
+[repo_or_url] [filter_query] [--revision REVISION]
 ```
 
 - `repo_or_url`: HF repo id or HF model URL.
@@ -64,6 +64,43 @@ export HF_TOKEN=your_token_here
 ```bash
 [repo_or_url] [filter_query] [--revision REVISION] [-c FORMAT]
 ```
+
+Optional flags:
+- `--compression-config PATH`: JSON config describing the compression algorithm and its params.
+- `--recompute`: recompute and overwrite cached quantized tensors.
+- `--summary`: print the aggregate summary (default: off).
+
+Example compression config (`compression_config.mixed_tile_greedy.example.json`):
+
+```json
+{
+  "algorithm": "mixed-tile-greedy",
+  "quantization_formats": [
+    "mxfp4",
+    "nvfp4",
+    "bf16",
+    "bfp8",
+    "bfp4",
+    "bfp2",
+    "fp0"
+  ],
+  "params": {
+    "metric": "pcc",
+    "threshold": 0.999,
+    "cluster": "kmeans",
+    "k": 10
+  }
+}
+```
+
+Supported algorithms: `none`, `transpose`, `mixed-tile-greedy`, `mixed-tile-random`.
+If `quantization_formats` is omitted, all formats are used by default.
+For mixed-tile algorithms, `quantization_formats` is intersected with `bf16,bfp8,bfp4,bfp2`.
+When a config is provided, `wq` runs the selected algorithm alongside the `none` baseline.
+
+Other example configs:
+- `compression_config.transpose.example.json`
+- `compression_config.mixed_tile_random.example.json`
 
 ## Usage
 
@@ -102,19 +139,25 @@ python compare_reconstr_error_weights.py deepseek-ai/DeepSeek-R1 model.layers.0.
 ### 3) CLI Quantization report
 
 ```bash
-python ./wq deepseek-ai/DeepSeek-R1 model.layers.0.self_attn -c all --limit 10
+python ./wq deepseek-ai/DeepSeek-R1 model.layers.0.self_attn --limit 10
 ```
 
 Use emulation backend (default):
 
 ```bash
-python ./wq deepseek-ai/DeepSeek-R1 model.layers.0.self_attn -c bfp8 -c bfp4 -c bfp2 --backend emulation
+python ./wq deepseek-ai/DeepSeek-R1 model.layers.0.self_attn --backend emulation
+```
+
+Compare compression modes:
+
+```bash
+python ./wq deepseek-ai/DeepSeek-R1 model.layers.0.self_attn --compression-config compression_config.mixed_tile_greedy.example.json
 ```
 
 Use TTNN roundtrip backend for BFP formats:
 
 ```bash
-python ./wq deepseek-ai/DeepSeek-R1 model.layers.0.self_attn -c bfp8 -c bfp4 -c bfp2 --backend ttnn
+python ./wq deepseek-ai/DeepSeek-R1 model.layers.0.self_attn --backend ttnn
 ```
 
 Notes:

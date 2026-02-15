@@ -1,0 +1,17 @@
+{
+  "algorithm": "mixed-tile-random",
+  "quantization_formats": [
+    "bf16",
+    "bfp8",
+    "bfp4",
+    "bfp2",
+    "fp0"
+  ],
+  "params": {
+    "metric": "pcc",
+    "threshold": 0.999,
+    "iters": 2,
+    "formats": "bf16,bfp8,bfp4,bfp2",
+    "seed": 0
+  }
+}

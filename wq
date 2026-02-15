@@ -5,11 +5,28 @@ import argparse
 import os
 import sys
 from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
 
 import numpy as np
+from tqdm import tqdm
 
-from hf_model_utils import build_model_index, resolve_format_list, resolve_selected_tensors, load_tensor_fp32
-from quantization_formats import SUPPORTED_FORMATS, quantize_weight_values
+from compression_algorithms import create_algorithm
+from compression_algorithms.cache import CacheContext
+from compression_algorithms.config import load_compression_config
+from compression_algorithms.metrics import pearson_corr
+from compression_algorithms.quantizer import Quantizer
+from compression_algorithms.tile_utils import MIXED_TILE_FORMATS
+from hf_model_utils import (
+    _safe_repo_revision_key,
+    _safe_tensor_key,
+    build_model_index,
+    fp32_tensor_cache_dir,
+    load_tensor_fp32,
+    resolve_format_list,
+    resolve_selected_tensors,
+)
+from quantization_formats import SUPPORTED_FORMATS
 
 
 def parse_args() -> argparse.Namespace:
@@ -30,33 +47,31 @@ def parse_args() -> argparse.Namespace:
         help="Shared local cache for downloaded/dequantized tensors (default: data/hf-cache).",
     )
     parser.add_argument(
-        "-c",
-        "--compress",
-        action="append",
-        metavar="FORMAT",
-        help="Quantization formats to evaluate: mxfp4, nvfp4, bf16, bfp8, bfp4, bfp2, fp0, or all.",
+        "--limit", type=int, default=None, help="Optional max matched tensors."
     )
-    parser.add_argument("--limit", type=int, default=None, help="Optional max matched tensors.")
     parser.add_argument(
         "--backend",
         choices=["emulation", "ttnn"],
         default="emulation",
         help="Quantization backend for BFP formats (default: emulation).",
     )
+    parser.add_argument(
+        "--compression-config",
+        type=str,
+        default=None,
+        help="Path to a JSON compression config file (default: none).",
+    )
+    parser.add_argument(
+        "--recompute",
+        action="store_true",
+        help="Recompute and overwrite cached quantized tensors.",
+    )
+    parser.add_argument(
+        "--summary",
+        action="store_true",
+        help="Print the aggregate summary (default: off).",
+    )
     return parser.parse_args()
-
-
-def _pearson_corr(a: np.ndarray, b: np.ndarray) -> float:
-    a = np.asarray(a, dtype=np.float32).reshape(-1)
-    b = np.asarray(b, dtype=np.float32).reshape(-1)
-    if a.size == 0:
-        return 1.0
-    am = a - np.mean(a)
-    bm = b - np.mean(b)
-    denom = float(np.linalg.norm(am) * np.linalg.norm(bm))
-    if denom == 0.0:
-        return 1.0 if np.max(np.abs(a - b)) == 0.0 else 0.0
-    return float(np.dot(am, bm) / denom)
 
 
 def _tensor_meta_str(x: np.ndarray) -> str:
@@ -101,9 +116,12 @@ def color_err(v: float) -> str:
 @dataclass
 class Row:
     fmt: str
+    compression: str
     pcc: float
     mae: float
     atol: float
+    tile_counts: dict[str, int] | None = None
+    tile_bytes: float | None = None
 
 
 def _import_ttnn_quiet():
@@ -115,30 +133,6 @@ def _import_ttnn_quiet():
     except ModuleNotFoundError as exc:
         raise RuntimeError("TTNN backend requires `ttnn` in the active Python environment.") from exc
     return ttnn
-
-
-def _quantize_with_backend(xf: np.ndarray, fmt: str, backend: str, ttnn=None) -> np.ndarray:
-    fmt_l = fmt.lower()
-    if backend == "ttnn" and fmt_l in {"bfp8", "bfp4"}:
-        import torch
-
-        dtype_attr_map = {
-            "bfp8": "bfloat8_b",
-            "bfp4": "bfloat4_b",
-            "bfp2": "bfloat2_b",
-        }
-        attr = dtype_attr_map[fmt_l]
-        if ttnn is None:
-            raise RuntimeError("Internal error: TTNN backend selected but ttnn is not initialized.")
-        if not hasattr(ttnn, attr):
-            raise RuntimeError(f"Active ttnn does not support format '{fmt_l}' (missing {attr}).")
-        tt_dtype = getattr(ttnn, attr)
-        x_t = torch.from_numpy(np.asarray(xf, dtype=np.float32))
-        tt_tensor = ttnn.from_torch(x_t, dtype=tt_dtype, layout=ttnn.TILE_LAYOUT)
-        y_t = ttnn.to_torch(tt_tensor).to(dtype=torch.float32).cpu()
-        return y_t.numpy()
-
-    return quantize_weight_values(xf, fmt_l)
 
 
 def _build_hierarchy(tensor_names: list[str]) -> dict:
@@ -181,8 +175,15 @@ def _print_hierarchy(tensor_names: list[str]) -> None:
 
 def run() -> int:
     args = parse_args()
+    run_tag = datetime.now().strftime("%Y%m%d-%H%M%S")
+
+    config = load_compression_config(args.compression_config)
+    selected_algo = create_algorithm(config.algorithm, config.params)
+    baseline = create_algorithm("none", {})
+    algorithms = [baseline] if selected_algo.name == "none" else [baseline, selected_algo]
+
     filter_query = " ".join(args.filter_query).strip() or None
-    formats = resolve_format_list(args.compress, SUPPORTED_FORMATS)
+    formats = resolve_format_list(config.quantization_formats, SUPPORTED_FORMATS)
 
     index = build_model_index(repo_or_url=args.repo_or_url, revision=args.revision, cache_dir=args.cache_dir)
     tensor_names = resolve_selected_tensors(index, filter_query)
@@ -200,62 +201,146 @@ def run() -> int:
             print(f"error: {exc}", file=sys.stderr)
             return 1
 
+    quantizer = Quantizer(backend=args.backend, ttnn=ttnn)
+
+    compression_names = [algo.name for algo in algorithms]
+    comp_w = max(len("COMP"), max((len(name) for name in compression_names), default=0))
     print(
         f"{paint(index.repo_id, 'title')} {paint('@', 'muted')}{paint(index.revision, 'cyan')} "
         f"{paint('-', 'muted')} {paint(str(len(tensor_names)), 'title')} {paint('tensors', 'muted')}"
     )
     print(f"{paint('formats:', 'muted')} {', '.join(formats)}")
+    print(f"{paint('compression:', 'muted')} {', '.join(compression_names)}")
     print(f"{paint('backend:', 'muted')} {args.backend}")
+    if args.compression_config:
+        print(f"{paint('config:', 'muted')} {args.compression_config}")
     print()
     _print_hierarchy(tensor_names)
 
-    aggregate: dict[str, list[Row]] = {fmt: [] for fmt in formats}
+    processed_root = Path("data/processed") / _safe_repo_revision_key(index.repo_id, index.revision)
+    aggregate: dict[tuple[str, str], list[Row]] = {}
+
+    total_evals = len(tensor_names) * sum(algo.expected_evals(formats) for algo in algorithms)
+    pbar = tqdm(total=total_evals, desc="Evaluating", unit="eval")
 
     for tensor_name in tensor_names:
+        cache_file = fp32_tensor_cache_dir(index) / f"{_safe_tensor_key(tensor_name)}.npy"
+        if cache_file.exists():
+            print(f"{paint('cache:', 'muted')} fp32 hit ({cache_file})")
+        else:
+            print(f"{paint('cache:', 'muted')} fp32 miss -> loading from HF cache/download")
         x = load_tensor_fp32(index, tensor_name)
         xf = np.asarray(x, dtype=np.float32)
         print(paint(tensor_name, "title"))
         print(f"  {paint(_tensor_meta_str(xf), 'muted')}")
 
-        rows: list[Row] = []
-        for fmt in formats:
-            y = _quantize_with_backend(xf=xf, fmt=fmt, backend=args.backend, ttnn=ttnn)
-            diff = np.abs(xf - y)
-            mae = float(np.mean(diff))
-            atol = float(np.max(diff))
-            pcc = _pearson_corr(xf, y)
-            row = Row(fmt=fmt.upper(), pcc=pcc, mae=mae, atol=atol)
-            rows.append(row)
-            aggregate[fmt].append(row)
-
-        fmt_w = max(len(r.fmt) for r in rows)
-        print(f"  {paint('FORMAT'.ljust(fmt_w), 'muted')}  {paint('PCC', 'muted')}      {paint('MAE', 'muted')}      {paint('ATOL', 'muted')}")
-        for r in rows:
-            pcc_txt = f"{r.pcc: .5f}"
-            mae_txt = f"{r.mae:.3e}"
-            atol_txt = f"{r.atol:.3e}"
-            print(
-                f"  {r.fmt.ljust(fmt_w)}  "
-                f"{paint(pcc_txt, color_pcc(r.pcc))}  "
-                f"{paint(mae_txt, color_err(r.mae))}  "
-                f"{paint(atol_txt, color_err(r.atol))}"
-            )
-        print()
-
-    print(paint("Summary (mean across matched tensors)", "title"))
-    for fmt in formats:
-        rows = aggregate[fmt]
-        if not rows:
-            continue
-        pcc = float(np.mean([r.pcc for r in rows]))
-        mae = float(np.mean([r.mae for r in rows]))
-        atol = float(np.mean([r.atol for r in rows]))
-        print(
-            f"  {fmt.upper():>5}  "
-            f"pcc={paint(f'{pcc: .5f}', color_pcc(pcc))}  "
-            f"mae={paint(f'{mae:.3e}', color_err(mae))}  "
-            f"atol={paint(f'{atol:.3e}', color_err(atol))}"
+        cache_ctx = CacheContext(
+            root=processed_root,
+            tensor_name=tensor_name,
+            backend=args.backend,
+            recompute=args.recompute,
+            run_tag=run_tag,
         )
+
+        rows_by_comp: dict[str, list[Row]] = {}
+        for algo in algorithms:
+            results = algo.run(xf=xf, formats=formats, quantizer=quantizer, cache=cache_ctx)
+            for res in results:
+                diff = np.abs(xf - res.y)
+                mae = float(np.mean(diff))
+                atol = float(np.max(diff))
+                pcc = pearson_corr(xf, res.y)
+                row = Row(
+                    fmt=res.fmt,
+                    compression=res.compression,
+                    pcc=pcc,
+                    mae=mae,
+                    atol=atol,
+                    tile_counts=res.tile_counts,
+                    tile_bytes=res.tile_bytes,
+                )
+                rows_by_comp.setdefault(res.compression, []).append(row)
+                aggregate.setdefault((res.compression, res.fmt), []).append(row)
+                pbar.update(1)
+
+        for comp in compression_names:
+            rows = rows_by_comp.get(comp, [])
+            if not rows:
+                continue
+            fmt_w = max(len(r.fmt) for r in rows)
+            if comp in {"mixed-tile-greedy", "mixed-tile-random"}:
+                count_widths = {k: len(k.upper()) for k in MIXED_TILE_FORMATS}
+                bytes_w = len("BYTES")
+                for r in rows:
+                    counts = r.tile_counts or {}
+                    for k in MIXED_TILE_FORMATS:
+                        count_widths[k] = max(count_widths[k], len(str(counts.get(k, 0))))
+                    if r.tile_bytes is not None:
+                        bytes_w = max(bytes_w, len(f"{r.tile_bytes:,.0f}"))
+                count_hdr = "  ".join(k.upper().rjust(count_widths[k]) for k in MIXED_TILE_FORMATS)
+                print(
+                    f"  {paint('COMP'.ljust(comp_w), 'muted')}  {paint('FORMAT'.ljust(fmt_w), 'muted')}  "
+                    f"{paint('PCC', 'muted')}      {paint('MAE', 'muted')}      {paint('ATOL', 'muted')}  "
+                    f"{paint(count_hdr, 'muted')}  {paint('BYTES'.rjust(bytes_w), 'muted')}"
+                )
+                for r in rows:
+                    pcc_txt = f"{r.pcc: .5f}"
+                    mae_txt = f"{r.mae:.3e}"
+                    atol_txt = f"{r.atol:.3e}"
+                    counts = r.tile_counts or {}
+                    counts_txt = "  ".join(str(counts.get(k, 0)).rjust(count_widths[k]) for k in MIXED_TILE_FORMATS)
+                    bytes_txt = f"{(r.tile_bytes or 0.0):,.0f}".rjust(bytes_w)
+                    print(
+                        f"  {r.compression.ljust(comp_w)}  {r.fmt.ljust(fmt_w)}  "
+                        f"{paint(pcc_txt, color_pcc(r.pcc))}  "
+                        f"{paint(mae_txt, color_err(r.mae))}  "
+                        f"{paint(atol_txt, color_err(r.atol))}  "
+                        f"{counts_txt}  {bytes_txt}"
+                    )
+            else:
+                print(
+                    f"  {paint('COMP'.ljust(comp_w), 'muted')}  {paint('FORMAT'.ljust(fmt_w), 'muted')}  "
+                    f"{paint('PCC', 'muted')}      {paint('MAE', 'muted')}      {paint('ATOL', 'muted')}"
+                )
+                for r in rows:
+                    pcc_txt = f"{r.pcc: .5f}"
+                    mae_txt = f"{r.mae:.3e}"
+                    atol_txt = f"{r.atol:.3e}"
+                    print(
+                        f"  {r.compression.ljust(comp_w)}  {r.fmt.ljust(fmt_w)}  "
+                        f"{paint(pcc_txt, color_pcc(r.pcc))}  "
+                        f"{paint(mae_txt, color_err(r.mae))}  "
+                        f"{paint(atol_txt, color_err(r.atol))}"
+                    )
+            print()
+
+    pbar.close()
+    if args.summary:
+        print(paint("Summary (mean across matched tensors)", "title"))
+        for comp in compression_names:
+            if comp in {"mixed-tile-greedy", "mixed-tile-random"}:
+                fmt_list = ["MIXED"]
+            else:
+                fmt_list = [fmt.upper() for fmt in formats]
+            for fmt in fmt_list:
+                rows = aggregate.get((comp, fmt), [])
+                if not rows:
+                    continue
+                pcc = float(np.mean([r.pcc for r in rows]))
+                mae = float(np.mean([r.mae for r in rows]))
+                atol = float(np.mean([r.atol for r in rows]))
+                bytes_vals = [r.tile_bytes for r in rows if r.tile_bytes is not None]
+                bytes_txt = ""
+                if bytes_vals:
+                    bytes_mean = float(np.mean(bytes_vals))
+                    bytes_txt = f"  bytes={bytes_mean:,.0f}"
+                print(
+                    f"  {comp.ljust(comp_w)} {fmt:>5}  "
+                    f"pcc={paint(f'{pcc: .5f}', color_pcc(pcc))}  "
+                    f"mae={paint(f'{mae:.3e}', color_err(mae))}  "
+                    f"atol={paint(f'{atol:.3e}', color_err(atol))}"
+                    f"{bytes_txt}"
+                )
 
     return 0
 
