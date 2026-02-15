@@ -70,7 +70,7 @@ Optional flags:
 - `--recompute`: recompute and overwrite cached quantized tensors.
 - `--summary`: print the aggregate summary (default: off).
 
-Example compression config (`compression_config.mixed_tile_greedy.example.json`):
+Example compression config (`compression_configs/compression_config.mixed_tile_greedy.example.json`):
 
 ```json
 {
@@ -97,10 +97,11 @@ Supported algorithms: `none`, `transpose`, `mixed-tile-greedy`, `mixed-tile-rand
 If `quantization_formats` is omitted, all formats are used by default.
 For mixed-tile algorithms, `quantization_formats` is intersected with `bf16,bfp8,bfp4,bfp2`.
 When a config is provided, `wq` runs the selected algorithm alongside the `none` baseline.
+Optional `seed` can be an integer or the string `random`; the used seed is recorded in `compression_config.used.json`.
 
 Other example configs:
-- `compression_config.transpose.example.json`
-- `compression_config.mixed_tile_random.example.json`
+- `compression_configs/compression_config.transpose.example.json`
+- `compression_configs/compression_config.mixed_tile_random.example.json`
 
 ## Usage
 
@@ -151,7 +152,7 @@ python ./wq deepseek-ai/DeepSeek-R1 model.layers.0.self_attn --backend emulation
 Compare compression modes:
 
 ```bash
-python ./wq deepseek-ai/DeepSeek-R1 model.layers.0.self_attn --compression-config compression_config.mixed_tile_greedy.example.json
+python ./wq deepseek-ai/DeepSeek-R1 model.layers.0.self_attn --compression-config compression_configs/compression_config.mixed_tile_greedy.example.json
 ```
 
 Use TTNN roundtrip backend for BFP formats:
@@ -163,6 +164,8 @@ python ./wq deepseek-ai/DeepSeek-R1 model.layers.0.self_attn --backend ttnn
 Notes:
 - `--backend ttnn` requires `ttnn` in the active Python environment.
 - With `--backend ttnn`, only `bfp8` and `bfp4` use TTNN conversion. `bfp2` and other formats still use emulation.
+- Each run writes a `results/<model>/<algorithm>/<timestamp>/` folder with `table.txt` and a copy of the config used. Mixed-tile-random also emits per-tensor CSV/PNG under `results/.../mixed_tile_random`.
+- Mixed-tile-random also writes per-tensor assignment maps (`*_assignment.npy`) plus a JSON mapping file, which can be reconstructed with `scripts/reconstruct_mixed_tile_assignment.py`.
 
 Open all generated PNGs on macOS:
 

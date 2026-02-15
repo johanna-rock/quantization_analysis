@@ -2,11 +2,15 @@
 from __future__ import annotations
 
 import argparse
+import csv
+import json
 import os
+import re
 import sys
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+import secrets
 
 import numpy as np
 from tqdm import tqdm
@@ -97,6 +101,17 @@ def paint(text: str, color: str) -> str:
     return f"{COLORS[color]}{text}{COLORS['reset']}"
 
 
+ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def strip_ansi(text: str) -> str:
+    return ANSI_RE.sub("", text)
+
+
+def _slug(s: str) -> str:
+    return re.sub(r"[^a-zA-Z0-9._-]+", "_", s).strip("_") or "tensor"
+
+
 def color_pcc(v: float) -> str:
     if v >= 0.999:
         return "good"
@@ -105,12 +120,91 @@ def color_pcc(v: float) -> str:
     return "bad"
 
 
+def pcc_plot_color(v: float) -> str:
+    bucket = color_pcc(v)
+    if bucket == "good":
+        return "#2ca02c"
+    if bucket == "mid":
+        return "#ffbf00"
+    return "#d62728"
+
+
 def color_err(v: float) -> str:
     if v <= 1e-4:
         return "good"
     if v <= 1e-3:
         return "mid"
     return "bad"
+
+
+def _write_mixed_tile_random_outputs(
+    out_dir: Path,
+    tensor_name: str,
+    samples: list[dict],
+    tile_formats: list[str],
+    assignment: np.ndarray | None,
+) -> None:
+    if not samples:
+        return
+
+    mt_dir = out_dir / "mixed_tile_random"
+    mt_dir.mkdir(parents=True, exist_ok=True)
+    slug = _slug(tensor_name)
+
+    csv_path = mt_dir / f"{slug}.csv"
+    headers = ["sample_id", *[f"{fmt}_tiles" for fmt in tile_formats], "total_gb", "pcc", "mae", "atol"]
+    with csv_path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(headers)
+        for sample in samples:
+            counts = sample.get("counts", {})
+            total_gb = float(sample.get("total_bytes", 0.0)) / 1e9
+            row = [
+                sample.get("id"),
+                *[counts.get(fmt, 0) for fmt in tile_formats],
+                total_gb,
+                sample.get("pcc"),
+                sample.get("mae"),
+                sample.get("atol"),
+            ]
+            writer.writerow(row)
+
+    if assignment is not None:
+        assign_path = mt_dir / f"{slug}_assignment.npy"
+        np.save(assign_path, assignment.astype(np.int8))
+        mapping_path = mt_dir / f"{slug}_assignment_mapping.json"
+        mapping = {
+            "tile_hw": 32,
+            "format_to_int": {fmt: idx for idx, fmt in enumerate(MIXED_TILE_FORMATS)},
+            "int_to_format": MIXED_TILE_FORMATS,
+            "assignment_shape": list(assignment.shape),
+        }
+        with mapping_path.open("w", encoding="utf-8") as f:
+            json.dump(mapping, f, indent=2)
+
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except Exception:
+        return
+
+    xs = [float(sample.get("pcc", 0.0)) for sample in samples]
+    ys = [float(sample.get("total_bytes", 0.0)) / 1e9 for sample in samples]
+    colors = [pcc_plot_color(x) for x in xs]
+
+    fig, ax = plt.subplots(figsize=(6.5, 4.5))
+    ax.scatter(xs, ys, c=colors, s=28, alpha=0.9)
+    for sample, x, y in zip(samples, xs, ys):
+        ax.annotate(str(sample.get("id")), (x, y), textcoords="offset points", xytext=(4, 4), fontsize=7)
+    ax.set_xlabel("PCC")
+    ax.set_ylabel("Total size (GB)")
+    ax.set_title("Mixed-tile random samples")
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(mt_dir / f"{slug}.png", dpi=160)
+    plt.close(fig)
 
 
 @dataclass
@@ -178,7 +272,24 @@ def run() -> int:
     run_tag = datetime.now().strftime("%Y%m%d-%H%M%S")
 
     config = load_compression_config(args.compression_config)
-    selected_algo = create_algorithm(config.algorithm, config.params)
+    algo_params = dict(config.params)
+    seed_source = None
+    if config.seed is not None:
+        used_seed = config.seed
+        seed_source = "config"
+    elif config.random_seed:
+        used_seed = secrets.randbits(31)
+        seed_source = "random"
+    else:
+        used_seed = None
+
+    if used_seed is not None:
+        algo_params["seed"] = used_seed
+    elif "seed" in algo_params:
+        used_seed = algo_params["seed"]
+        seed_source = "params"
+
+    selected_algo = create_algorithm(config.algorithm, algo_params)
     baseline = create_algorithm("none", {})
     algorithms = [baseline] if selected_algo.name == "none" else [baseline, selected_algo]
 
@@ -205,6 +316,8 @@ def run() -> int:
 
     compression_names = [algo.name for algo in algorithms]
     comp_w = max(len("COMP"), max((len(name) for name in compression_names), default=0))
+    results_dir = None
+    table_lines: list[str] = []
     print(
         f"{paint(index.repo_id, 'title')} {paint('@', 'muted')}{paint(index.revision, 'cyan')} "
         f"{paint('-', 'muted')} {paint(str(len(tensor_names)), 'title')} {paint('tensors', 'muted')}"
@@ -216,6 +329,26 @@ def run() -> int:
         print(f"{paint('config:', 'muted')} {args.compression_config}")
     print()
     _print_hierarchy(tensor_names)
+
+    safe_model = index.repo_id.replace("/", "__")
+    results_dir = Path("results") / safe_model / selected_algo.name / run_tag
+    results_dir.mkdir(parents=True, exist_ok=True)
+    used_params = dict(algo_params)
+    if used_seed is not None and "seed" in used_params:
+        used_params.pop("seed", None)
+
+    used_config = {
+        "algorithm": config.algorithm,
+        "quantization_formats": formats,
+        "params": used_params,
+    }
+    if used_seed is not None:
+        used_config["seed"] = used_seed
+        if seed_source:
+            used_config["seed_source"] = seed_source
+
+    with (results_dir / "compression_config.used.json").open("w", encoding="utf-8") as f:
+        json.dump(used_config, f, indent=2)
 
     processed_root = Path("data/processed") / _safe_repo_revision_key(index.repo_id, index.revision)
     aggregate: dict[tuple[str, str], list[Row]] = {}
@@ -263,6 +396,19 @@ def run() -> int:
                 aggregate.setdefault((res.compression, res.fmt), []).append(row)
                 pbar.update(1)
 
+                if (
+                    res.compression == "mixed-tile-random"
+                    and res.meta
+                    and results_dir is not None
+                ):
+                    samples = res.meta.get("samples")
+                    tile_formats = res.meta.get("tile_formats", [])
+                    assignment = res.meta.get("assignment")
+                    if isinstance(samples, list) and tile_formats:
+                        _write_mixed_tile_random_outputs(
+                            results_dir, tensor_name, samples, tile_formats, assignment
+                        )
+
         for comp in compression_names:
             rows = rows_by_comp.get(comp, [])
             if not rows:
@@ -278,11 +424,13 @@ def run() -> int:
                     if r.tile_bytes is not None:
                         bytes_w = max(bytes_w, len(f"{r.tile_bytes:,.0f}"))
                 count_hdr = "  ".join(k.upper().rjust(count_widths[k]) for k in MIXED_TILE_FORMATS)
-                print(
+                header = (
                     f"  {paint('COMP'.ljust(comp_w), 'muted')}  {paint('FORMAT'.ljust(fmt_w), 'muted')}  "
                     f"{paint('PCC', 'muted')}      {paint('MAE', 'muted')}      {paint('ATOL', 'muted')}  "
                     f"{paint(count_hdr, 'muted')}  {paint('BYTES'.rjust(bytes_w), 'muted')}"
                 )
+                print(header)
+                table_lines.append(strip_ansi(header))
                 for r in rows:
                     pcc_txt = f"{r.pcc: .5f}"
                     mae_txt = f"{r.mae:.3e}"
@@ -290,33 +438,41 @@ def run() -> int:
                     counts = r.tile_counts or {}
                     counts_txt = "  ".join(str(counts.get(k, 0)).rjust(count_widths[k]) for k in MIXED_TILE_FORMATS)
                     bytes_txt = f"{(r.tile_bytes or 0.0):,.0f}".rjust(bytes_w)
-                    print(
+                    line = (
                         f"  {r.compression.ljust(comp_w)}  {r.fmt.ljust(fmt_w)}  "
                         f"{paint(pcc_txt, color_pcc(r.pcc))}  "
                         f"{paint(mae_txt, color_err(r.mae))}  "
                         f"{paint(atol_txt, color_err(r.atol))}  "
                         f"{counts_txt}  {bytes_txt}"
                     )
+                    print(line)
+                    table_lines.append(strip_ansi(line))
             else:
-                print(
+                header = (
                     f"  {paint('COMP'.ljust(comp_w), 'muted')}  {paint('FORMAT'.ljust(fmt_w), 'muted')}  "
                     f"{paint('PCC', 'muted')}      {paint('MAE', 'muted')}      {paint('ATOL', 'muted')}"
                 )
+                print(header)
+                table_lines.append(strip_ansi(header))
                 for r in rows:
                     pcc_txt = f"{r.pcc: .5f}"
                     mae_txt = f"{r.mae:.3e}"
                     atol_txt = f"{r.atol:.3e}"
-                    print(
+                    line = (
                         f"  {r.compression.ljust(comp_w)}  {r.fmt.ljust(fmt_w)}  "
                         f"{paint(pcc_txt, color_pcc(r.pcc))}  "
                         f"{paint(mae_txt, color_err(r.mae))}  "
                         f"{paint(atol_txt, color_err(r.atol))}"
                     )
+                    print(line)
+                    table_lines.append(strip_ansi(line))
             print()
+            table_lines.append("")
 
     pbar.close()
     if args.summary:
         print(paint("Summary (mean across matched tensors)", "title"))
+        table_lines.append("Summary (mean across matched tensors)")
         for comp in compression_names:
             if comp in {"mixed-tile-greedy", "mixed-tile-random"}:
                 fmt_list = ["MIXED"]
@@ -334,13 +490,18 @@ def run() -> int:
                 if bytes_vals:
                     bytes_mean = float(np.mean(bytes_vals))
                     bytes_txt = f"  bytes={bytes_mean:,.0f}"
-                print(
+                line = (
                     f"  {comp.ljust(comp_w)} {fmt:>5}  "
                     f"pcc={paint(f'{pcc: .5f}', color_pcc(pcc))}  "
                     f"mae={paint(f'{mae:.3e}', color_err(mae))}  "
                     f"atol={paint(f'{atol:.3e}', color_err(atol))}"
                     f"{bytes_txt}"
                 )
+                print(line)
+                table_lines.append(strip_ansi(line))
+
+    if results_dir is not None and table_lines:
+        (results_dir / "table.txt").write_text("\n".join(table_lines) + "\n", encoding="utf-8")
 
     return 0
 

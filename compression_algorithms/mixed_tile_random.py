@@ -4,12 +4,11 @@ import numpy as np
 
 from .base import CompressionAlgorithm, CompressionResult
 from .cache import CacheContext
-from .metrics import metric_better, metric_is_good, metric_value
+from .metrics import metric_better, metric_is_good, metric_value, pearson_corr
 from .quantizer import Quantizer
 from .tile_utils import (
     MIXED_TILE_BYTES_PER_ELEM,
     MIXED_TILE_FORMATS,
-    assignment_to_array,
     mixed_tile_total_bytes,
     reconstruct_from_tiles,
     reshape_to_2d_with_padding,
@@ -91,12 +90,13 @@ class MixedTileRandomCompression(CompressionAlgorithm):
         xf: np.ndarray,
         quantizer: Quantizer,
         tile_formats: list[str],
-    ) -> tuple[np.ndarray, dict[str, int], np.ndarray]:
+    ) -> tuple[np.ndarray, dict[str, int], np.ndarray, list[dict]]:
         if xf.size == 0:
             return (
                 np.asarray(xf, dtype=np.float32),
                 {fmt: 0 for fmt in MIXED_TILE_FORMATS},
                 np.zeros((1, 1), dtype=np.int8),
+                [],
             )
 
         padded, shape_info, pad_info = reshape_to_2d_with_padding(xf)
@@ -127,17 +127,35 @@ class MixedTileRandomCompression(CompressionAlgorithm):
         best_tiles = None
         best_assignments = None
         best_bytes = None
+        samples: list[dict] = []
 
-        for _ in range(max(1, self.iters)):
+        for sample_id in range(max(1, self.iters)):
             choice_idx = rng.integers(0, len(fmt_indices), size=tiles_ref.shape[0], dtype=np.int64)
             assignments = fmt_indices[choice_idx].astype(np.int8)
             tiles_q = self._quantize_tiles_by_assignment(tiles_ref, assignments, quantizer)
             y = reconstruct_from_tiles(tiles_q, shape_info, pad_info, tile_hw=tile_hw)
             score = metric_value(xf, y, self.metric)
+            diff = np.abs(xf - y)
+            mae = float(np.mean(diff))
+            atol = float(np.max(diff))
+            pcc = pearson_corr(xf, y)
+
+            counts_arr = np.bincount(assignments.astype(np.int64), minlength=len(MIXED_TILE_FORMATS))
+            counts = {fmt: int(counts_arr[i]) for i, fmt in enumerate(MIXED_TILE_FORMATS)}
+            total_bytes = mixed_tile_total_bytes(counts)
+            samples.append(
+                {
+                    "id": sample_id,
+                    "counts": counts,
+                    "total_bytes": total_bytes,
+                    "pcc": pcc,
+                    "mae": mae,
+                    "atol": atol,
+                }
+            )
             meets = metric_is_good(score, self.metric, self.threshold)
             if meets:
-                counts = np.bincount(assignments.astype(np.int64), minlength=len(MIXED_TILE_FORMATS))
-                total_bytes = float(np.sum(counts * bytes_per_elem) * (tile_hw * tile_hw))
+                total_bytes = float(np.sum(counts_arr * bytes_per_elem) * (tile_hw * tile_hw))
                 if best_bytes is None or total_bytes < best_bytes:
                     best_bytes = total_bytes
                     best_metric = score
@@ -161,6 +179,7 @@ class MixedTileRandomCompression(CompressionAlgorithm):
             reconstruct_from_tiles(best_tiles, shape_info, pad_info, tile_hw=tile_hw),
             counts,
             best_assignments.reshape(tiles_h, tiles_w),
+            samples,
         )
 
     def run(
@@ -171,33 +190,11 @@ class MixedTileRandomCompression(CompressionAlgorithm):
         cache: CacheContext,
     ) -> list[CompressionResult]:
         tile_formats = self.formats or self._filter_from_formats(formats)
-        cache_path = cache.mixed_path(
-            compression=self.name,
-            metric=self.metric,
-            threshold=self.threshold,
-            cluster=None,
-            k=None,
-            iters=self.iters,
-            random_formats=tile_formats,
+        y, counts, assignment, samples = self._compress(
+            xf=xf,
+            quantizer=quantizer,
+            tile_formats=tile_formats,
         )
-        cached = cache.load_mixed(cache_path)
-        y = None
-        counts = None
-        assignment = None
-        if cached is not None:
-            y, counts, assignment = cached
-            if y.shape != xf.shape:
-                y = None
-                counts = None
-                assignment = None
-
-        if y is None or counts is None or assignment is None:
-            y, counts, assignment = self._compress(
-                xf=xf,
-                quantizer=quantizer,
-                tile_formats=tile_formats,
-            )
-            cache.save_mixed(cache_path, y, counts, assignment_to_array(assignment))
 
         total_bytes = mixed_tile_total_bytes(counts)
         return [
@@ -207,5 +204,6 @@ class MixedTileRandomCompression(CompressionAlgorithm):
                 y=y,
                 tile_counts=counts,
                 tile_bytes=total_bytes,
+                meta={"samples": samples, "tile_formats": tile_formats, "assignment": assignment},
             )
         ]

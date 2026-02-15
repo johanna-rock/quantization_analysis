@@ -8,7 +8,6 @@ from .metrics import metric_better, metric_is_good, metric_value
 from .quantizer import Quantizer
 from .tile_utils import (
     MIXED_TILE_FORMATS,
-    assignment_to_array,
     global_metric,
     kmeans_1d,
     mixed_tile_total_bytes,
@@ -196,33 +195,11 @@ class MixedTileGreedyCompression(CompressionAlgorithm):
         cache: CacheContext,
     ) -> list[CompressionResult]:
         tile_formats = self.tile_formats or self._filter_from_formats(formats)
-        cache_path = cache.mixed_path(
-            compression=self.name,
-            metric=self.metric,
-            threshold=self.threshold,
-            cluster=self.cluster,
-            k=self.k,
-            iters=None,
-            random_formats=None,
+        y, counts, assignment = self._compress(
+            xf=xf,
+            quantizer=quantizer,
+            tile_formats=tile_formats,
         )
-        cached = cache.load_mixed(cache_path)
-        y = None
-        counts = None
-        assignment = None
-        if cached is not None:
-            y, counts, assignment = cached
-            if y.shape != xf.shape:
-                y = None
-                counts = None
-                assignment = None
-
-        if y is None or counts is None or assignment is None:
-            y, counts, assignment = self._compress(
-                xf=xf,
-                quantizer=quantizer,
-                tile_formats=tile_formats,
-            )
-            cache.save_mixed(cache_path, y, counts, assignment_to_array(assignment))
 
         total_bytes = mixed_tile_total_bytes(counts)
         return [

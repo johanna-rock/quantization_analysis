@@ -17,6 +17,7 @@ class CompressionResult:
     y: np.ndarray
     tile_counts: dict[str, int] | None = None
     tile_bytes: float | None = None
+    meta: dict | None = None
 
 
 class CompressionAlgorithm(ABC):
