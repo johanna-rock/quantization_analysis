@@ -42,6 +42,23 @@ def parse_args() -> argparse.Namespace:
         "tensor_name",
         help="Tensor name or filter (supports substrings and fnmatch patterns like 'model.layers.*.weight').",
     )
+    parser.add_argument(
+        "--regex",
+        action="store_true",
+        default=True,
+        help="Interpret tensor_name as a regular expression (default: true).",
+    )
+    parser.add_argument(
+        "--no-regex",
+        dest="regex",
+        action="store_false",
+        help="Disable regex matching for tensor_name.",
+    )
+    parser.add_argument(
+        "--list-matches",
+        action="store_true",
+        help="List matched tensor names and exit.",
+    )
     parser.add_argument("--revision", default="main", help="Hugging Face revision (default: main).")
     parser.add_argument(
         "--cache-dir",
@@ -271,13 +288,23 @@ def _split_layer_suffix(tensor_name: str) -> tuple[int | None, str]:
     return int(match.group(1)), match.group(2)
 
 
-def _select_tensors(index, query: str) -> list[str]:
+def _select_tensors(index, query: str, use_regex: bool) -> list[str]:
     names = list(index.tensor_to_file.keys())
     weight_like = [
         n for n in names
         if "weight" in n.lower() and not n.lower().endswith("_scale_inv")
     ]
     candidates = weight_like if weight_like else names
+
+    if use_regex:
+        try:
+            pattern = re.compile(query)
+        except re.error as exc:
+            raise RuntimeError(f"Invalid regex '{query}': {exc}") from exc
+        matches = [n for n in candidates if pattern.search(n)]
+        if matches:
+            return sorted(matches)
+        raise RuntimeError("No tensors matched the regex query.")
 
     if query in candidates:
         return [query]
@@ -448,10 +475,15 @@ def main() -> int:
     formats = _parse_formats(args.formats)
 
     index = build_model_index(repo_or_url=args.repo_or_url, revision=args.revision, cache_dir=args.cache_dir)
-    selected_tensors = _select_tensors(index, args.tensor_name)
+    selected_tensors = _select_tensors(index, args.tensor_name, args.regex)
     if not selected_tensors:
         print("error: no tensors matched the filter query")
         return 1
+    if args.list_matches:
+        print(f"Matched {len(selected_tensors)} tensor(s):")
+        for name in selected_tensors:
+            print(f"  {name}")
+        return 0
 
     multiple = len(selected_tensors) > 1
     base_out_dir = args.out_dir
