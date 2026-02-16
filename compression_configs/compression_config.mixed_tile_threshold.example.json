@@ -1,0 +1,14 @@
+{
+  "algorithm": "mixed-tile-threshold",
+  "quantization_formats": [
+    "bf16",
+    "bfp8",
+    "bfp4",
+    "bfp2",
+    "fp0"
+  ],
+  "params": {
+    "metric": "pcc",
+    "threshold": 0.94
+  }
+}

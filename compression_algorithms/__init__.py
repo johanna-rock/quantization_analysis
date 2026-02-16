@@ -4,6 +4,7 @@ from .base import CompressionAlgorithm, CompressionResult
 from .config import CompressionConfig, load_compression_config
 from .mixed_tile_greedy import MixedTileGreedyCompression
 from .mixed_tile_random import MixedTileRandomCompression
+from .mixed_tile_threshold import MixedTileThresholdCompression
 from .none import NoneCompression
 from .transpose import TransposeCompression
 
@@ -11,6 +12,7 @@ ALGORITHM_REGISTRY: dict[str, type[CompressionAlgorithm]] = {
     "none": NoneCompression,
     "transpose": TransposeCompression,
     "mixed-tile-greedy": MixedTileGreedyCompression,
+    "mixed-tile-threshold": MixedTileThresholdCompression,
     "mixed-tile-random": MixedTileRandomCompression,
     "mixed-tile": MixedTileGreedyCompression,
 }

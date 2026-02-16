@@ -7,6 +7,7 @@ import json
 import os
 import re
 import sys
+import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -20,7 +21,7 @@ from compression_algorithms.cache import CacheContext
 from compression_algorithms.config import load_compression_config
 from compression_algorithms.metrics import pearson_corr
 from compression_algorithms.quantizer import Quantizer
-from compression_algorithms.tile_utils import MIXED_TILE_FORMATS
+from compression_algorithms.tile_utils import MIXED_TILE_BYTES_PER_ELEM, MIXED_TILE_FORMATS
 from hf_model_utils import (
     _safe_repo_revision_key,
     _safe_tensor_key,
@@ -128,6 +129,16 @@ def pcc_plot_color(v: float) -> str:
         return "#ffbf00"
     return "#d62728"
 
+FORMAT_BYTES_PER_ELEM = {
+    "mxfp4": 0.5,
+    "nvfp4": 0.5,
+    "bf16": 2.0,
+    "bfp8": 1.088,
+    "bfp4": 0.50097,
+    "bfp2": 0.25097,
+    "fp0": 0.0,
+}
+
 
 def color_err(v: float) -> str:
     if v <= 1e-4:
@@ -207,6 +218,179 @@ def _write_mixed_tile_random_outputs(
     plt.close(fig)
 
 
+def _write_tile_assignment_plot(
+    out_dir: Path,
+    tensor_name: str,
+    assignment: np.ndarray,
+) -> None:
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except Exception:
+        return
+
+    if assignment.size == 0:
+        return
+
+    fmt_bytes = {fmt: MIXED_TILE_BYTES_PER_ELEM[fmt] for fmt in MIXED_TILE_FORMATS}
+    sorted_fmts = sorted(MIXED_TILE_FORMATS, key=lambda f: fmt_bytes[f], reverse=True)
+    cmap = plt.get_cmap("Blues")
+    color_steps = np.linspace(0.95, 0.15, num=len(sorted_fmts))
+    fmt_to_color = {fmt: cmap(step) for fmt, step in zip(sorted_fmts, color_steps)}
+    idx_to_color = [fmt_to_color[fmt] for fmt in MIXED_TILE_FORMATS]
+
+    assignment_idx = np.asarray(assignment, dtype=np.int16)
+    mask = assignment_idx < 0
+    assignment_idx = np.where(mask, 0, assignment_idx)
+
+    h, w = assignment_idx.shape
+    cell_size = 0.4
+    fig_w = max(6.0, min(18.0, w * cell_size))
+    fig_h = max(6.0, min(18.0, h * cell_size))
+    fig, ax = plt.subplots(figsize=(fig_w, fig_h))
+    data = assignment_idx.astype(np.int16)
+    cmap_listed = matplotlib.colors.ListedColormap(idx_to_color)
+    cmap_listed.set_bad("gray")
+    img = np.ma.array(data, mask=mask)
+    ax.imshow(img, cmap=cmap_listed, vmin=-0.5, vmax=len(MIXED_TILE_FORMATS) - 0.5, interpolation="nearest")
+
+    x_step = 1 if w <= 64 else max(1, w // 32)
+    y_step = 1 if h <= 64 else max(1, h // 32)
+    ax.set_xticks(np.arange(0, w, x_step))
+    ax.set_yticks(np.arange(0, h, y_step))
+    ax.set_xticklabels([str(i) for i in range(0, w, x_step)], fontsize=7)
+    ax.set_yticklabels([str(i) for i in range(0, h, y_step)], fontsize=7)
+    ax.set_xlabel("Tile X")
+    ax.set_ylabel("Tile Y")
+
+    ax.set_xticks(np.arange(-0.5, w, 1), minor=True)
+    ax.set_yticks(np.arange(-0.5, h, 1), minor=True)
+    ax.grid(which="minor", color="white", linewidth=0.5, alpha=0.6)
+    ax.tick_params(which="minor", bottom=False, left=False)
+    ax.set_title("Tile format assignment")
+
+    from matplotlib.patches import Patch
+
+    legend_handles = [Patch(color=fmt_to_color[fmt], label=fmt.upper()) for fmt in sorted_fmts]
+    ax.legend(handles=legend_handles, title="Data format", loc="upper right", fontsize=8)
+    fig.tight_layout()
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    slug = _slug(tensor_name)
+    fig.savefig(out_dir / f"{slug}_assignment.png", dpi=160)
+    plt.close(fig)
+
+
+def _mixed_tile_threshold_dir(out_dir: Path, tensor_name: str) -> Path:
+    slug = _slug(tensor_name)
+    return out_dir / "mixed_tile_threshold" / slug
+
+
+def _write_mixed_tile_threshold_outputs(
+    out_dir: Path,
+    tensor_name: str,
+    assignment: np.ndarray | None,
+) -> None:
+    if assignment is None:
+        return
+    mt_dir = _mixed_tile_threshold_dir(out_dir, tensor_name)
+    mt_dir.mkdir(parents=True, exist_ok=True)
+    assign_path = mt_dir / "assignment.npy"
+    np.save(assign_path, assignment.astype(np.int8))
+    mapping_path = mt_dir / "assignment_mapping.json"
+    mapping = {
+        "tile_hw": 32,
+        "format_to_int": {fmt: idx for idx, fmt in enumerate(MIXED_TILE_FORMATS)},
+        "int_to_format": MIXED_TILE_FORMATS,
+        "assignment_shape": list(assignment.shape),
+    }
+    with mapping_path.open("w", encoding="utf-8") as f:
+        json.dump(mapping, f, indent=2)
+    _write_tile_assignment_plot(mt_dir, tensor_name, assignment)
+
+
+def _write_mixed_tile_threshold_size_plot(
+    out_dir: Path,
+    tensor_name: str,
+    metric_name: str,
+    points: list[dict],
+    formats: list[str],
+) -> None:
+    if not points:
+        return
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except Exception:
+        return
+
+    if metric_name == "pcc":
+        best_pcc = max(p["metric"] for p in points)
+        cutoff = 0.5 * best_pcc
+        points = [p for p in points if p["metric"] >= cutoff]
+        if not points:
+            return
+
+    max_bytes = max(p["bytes"] for p in points)
+    if max_bytes >= 1e9:
+        scale = 1e9
+        unit = "GB"
+    elif max_bytes >= 1e6:
+        scale = 1e6
+        unit = "MB"
+    else:
+        scale = 1e3
+        unit = "KB"
+
+    xs = [p["bytes"] / scale for p in points]
+    ys = [p["metric"] for p in points]
+    labels = [p["label"] for p in points]
+    colors = ["#1f77b4" if p.get("kind") == "baseline" else "#d62728" for p in points]
+    markers = ["o" if p.get("kind") == "baseline" else "X" for p in points]
+
+    fig, ax = plt.subplots(figsize=(6.0, 4.5))
+    for x, y, label, color, marker, point in zip(xs, ys, labels, colors, markers, points):
+        ax.scatter([x], [y], color=color, marker=marker, s=50)
+        size_mb = x * (scale / 1e6)
+        tile_parts = []
+        for fmt in formats:
+            count = point.get(f"{fmt}_tiles")
+            if count is not None:
+                tile_parts.append(f"{fmt}:{count}")
+        tile_text = f" [{' '.join(tile_parts)}]" if tile_parts else ""
+        ax.annotate(
+            f"{label} ({y:.3g}, {size_mb:.2f}MB){tile_text}",
+            (x, y),
+            textcoords="offset points",
+            xytext=(4, 4),
+            fontsize=6,
+        )
+
+    ax.set_xlabel(f"Size ({unit})")
+    ax.set_ylabel(metric_name.upper())
+    ax.set_title("Size vs accuracy")
+    ax.grid(True, alpha=0.3)
+    if formats:
+        from matplotlib.lines import Line2D
+
+        legend_elements = [
+            Line2D([0], [0], marker="o", color="w", label="Baseline", markerfacecolor="#1f77b4", markersize=7),
+            Line2D([0], [0], marker="X", color="w", label="Mixed", markerfacecolor="#d62728", markersize=7),
+            Line2D([0], [0], color="w", label="Annot: label (metric, size) [fmt:tiles]"),
+        ]
+        ax.legend(handles=legend_elements, loc="best", fontsize=8)
+    fig.tight_layout()
+
+    mt_dir = _mixed_tile_threshold_dir(out_dir, tensor_name)
+    mt_dir.mkdir(parents=True, exist_ok=True)
+    fig.savefig(mt_dir / "size_vs_accuracy.png", dpi=160)
+    plt.close(fig)
+
+
 @dataclass
 class Row:
     fmt: str
@@ -214,6 +398,8 @@ class Row:
     pcc: float
     mae: float
     atol: float
+    time_s: float
+    gb: float
     tile_counts: dict[str, int] | None = None
     tile_bytes: float | None = None
 
@@ -364,8 +550,12 @@ def run() -> int:
             print(f"{paint('cache:', 'muted')} fp32 miss -> loading from HF cache/download")
         x = load_tensor_fp32(index, tensor_name)
         xf = np.asarray(x, dtype=np.float32)
-        print(paint(tensor_name, "title"))
-        print(f"  {paint(_tensor_meta_str(xf), 'muted')}")
+        title_line = paint(tensor_name, "title")
+        print(title_line)
+        table_lines.append(strip_ansi(title_line))
+        meta_line = f"  {paint(_tensor_meta_str(xf), 'muted')}"
+        print(meta_line)
+        table_lines.append(strip_ansi(meta_line))
 
         cache_ctx = CacheContext(
             root=processed_root,
@@ -377,18 +567,30 @@ def run() -> int:
 
         rows_by_comp: dict[str, list[Row]] = {}
         for algo in algorithms:
+            t0 = time.perf_counter()
             results = algo.run(xf=xf, formats=formats, quantizer=quantizer, cache=cache_ctx)
+            elapsed = time.perf_counter() - t0
             for res in results:
                 diff = np.abs(xf - res.y)
                 mae = float(np.mean(diff))
                 atol = float(np.max(diff))
                 pcc = pearson_corr(xf, res.y)
+                fmt_l = res.fmt.lower()
+                bytes_per_elem = FORMAT_BYTES_PER_ELEM.get(fmt_l)
+                if res.tile_bytes is not None:
+                    gb = float(res.tile_bytes) / 1e9
+                elif bytes_per_elem is not None:
+                    gb = float(xf.size) * float(bytes_per_elem) / 1e9
+                else:
+                    gb = 0.0
                 row = Row(
                     fmt=res.fmt,
                     compression=res.compression,
                     pcc=pcc,
                     mae=mae,
                     atol=atol,
+                    time_s=elapsed,
+                    gb=gb,
                     tile_counts=res.tile_counts,
                     tile_bytes=res.tile_bytes,
                 )
@@ -408,33 +610,105 @@ def run() -> int:
                         _write_mixed_tile_random_outputs(
                             results_dir, tensor_name, samples, tile_formats, assignment
                         )
+                if (
+                    res.compression == "mixed-tile-threshold"
+                    and res.meta
+                    and results_dir is not None
+                ):
+                    assignment = res.meta.get("assignment")
+                    if isinstance(assignment, np.ndarray):
+                        _write_mixed_tile_threshold_outputs(
+                            results_dir, tensor_name, assignment
+                        )
+
+        if (
+            results_dir is not None
+            and selected_algo.name == "mixed-tile-threshold"
+            and "mixed-tile-threshold" in rows_by_comp
+        ):
+            metric_name = algo_params.get("metric", "pcc")
+            points: list[dict] = []
+            total_tiles = None
+            for r in rows_by_comp.get("mixed-tile-threshold", []):
+                if r.tile_counts:
+                    total_tiles = sum(r.tile_counts.values())
+                    break
+            for r in rows_by_comp.get("none", []):
+                metric_value = r.pcc if metric_name == "pcc" else (r.mae if metric_name == "mae" else r.atol)
+                baseline_counts = {fmt: 0 for fmt in MIXED_TILE_FORMATS}
+                fmt_key = r.fmt.lower()
+                if total_tiles is not None and fmt_key in baseline_counts:
+                    baseline_counts[fmt_key] = total_tiles
+                points.append(
+                    {
+                        "label": r.fmt.upper(),
+                        "bytes": r.gb * 1e9,
+                        "metric": metric_value,
+                        "kind": "baseline",
+                        **{f"{fmt}_tiles": baseline_counts.get(fmt, 0) for fmt in MIXED_TILE_FORMATS},
+                    }
+                )
+            for r in rows_by_comp.get("mixed-tile-threshold", []):
+                metric_value = r.pcc if metric_name == "pcc" else (r.mae if metric_name == "mae" else r.atol)
+                mixed_counts = {fmt: 0 for fmt in MIXED_TILE_FORMATS}
+                if r.tile_counts:
+                    for fmt in MIXED_TILE_FORMATS:
+                        mixed_counts[fmt] = r.tile_counts.get(fmt, 0)
+                points.append(
+                    {
+                        "label": "MIXED",
+                        "bytes": r.gb * 1e9,
+                        "metric": metric_value,
+                        "kind": "mixed",
+                        **{f"{fmt}_tiles": mixed_counts.get(fmt, 0) for fmt in MIXED_TILE_FORMATS},
+                    }
+                )
+            _write_mixed_tile_threshold_size_plot(
+                results_dir, tensor_name, metric_name, points, MIXED_TILE_FORMATS
+            )
 
         for comp in compression_names:
             rows = rows_by_comp.get(comp, [])
             if not rows:
                 continue
             fmt_w = max(len(r.fmt) for r in rows)
-            if comp in {"mixed-tile-greedy", "mixed-tile-random"}:
+            if comp in {"mixed-tile-greedy", "mixed-tile-random", "mixed-tile-threshold"}:
                 count_widths = {k: len(k.upper()) for k in MIXED_TILE_FORMATS}
                 bytes_w = len("BYTES")
+                time_w = len("TIME(s)")
+                gb_w = len("GB")
+                pcc_w = len("PCC")
+                mae_w = len("MAE")
+                atol_w = len("ATOL")
                 for r in rows:
                     counts = r.tile_counts or {}
                     for k in MIXED_TILE_FORMATS:
                         count_widths[k] = max(count_widths[k], len(str(counts.get(k, 0))))
                     if r.tile_bytes is not None:
                         bytes_w = max(bytes_w, len(f"{r.tile_bytes:,.0f}"))
+                    time_w = max(time_w, len(f"{r.time_s:.3f}"))
+                    gb_w = max(gb_w, len(f"{r.gb:.3f}"))
+                    pcc_w = max(pcc_w, len(f"{r.pcc: .5f}"))
+                    mae_w = max(mae_w, len(f"{r.mae:.3e}"))
+                    atol_w = max(atol_w, len(f"{r.atol:.3e}"))
                 count_hdr = "  ".join(k.upper().rjust(count_widths[k]) for k in MIXED_TILE_FORMATS)
                 header = (
                     f"  {paint('COMP'.ljust(comp_w), 'muted')}  {paint('FORMAT'.ljust(fmt_w), 'muted')}  "
-                    f"{paint('PCC', 'muted')}      {paint('MAE', 'muted')}      {paint('ATOL', 'muted')}  "
+                    f"{paint('PCC'.rjust(pcc_w), 'muted')}  "
+                    f"{paint('MAE'.rjust(mae_w), 'muted')}  "
+                    f"{paint('ATOL'.rjust(atol_w), 'muted')}  "
+                    f"{paint('TIME(s)'.rjust(time_w), 'muted')}  "
+                    f"{paint('GB'.rjust(gb_w), 'muted')}  "
                     f"{paint(count_hdr, 'muted')}  {paint('BYTES'.rjust(bytes_w), 'muted')}"
                 )
                 print(header)
                 table_lines.append(strip_ansi(header))
                 for r in rows:
-                    pcc_txt = f"{r.pcc: .5f}"
-                    mae_txt = f"{r.mae:.3e}"
-                    atol_txt = f"{r.atol:.3e}"
+                    pcc_txt = f"{r.pcc: .5f}".rjust(pcc_w)
+                    mae_txt = f"{r.mae:.3e}".rjust(mae_w)
+                    atol_txt = f"{r.atol:.3e}".rjust(atol_w)
+                    time_txt = f"{r.time_s:.3f}".rjust(time_w)
+                    gb_txt = f"{r.gb:.3f}".rjust(gb_w)
                     counts = r.tile_counts or {}
                     counts_txt = "  ".join(str(counts.get(k, 0)).rjust(count_widths[k]) for k in MIXED_TILE_FORMATS)
                     bytes_txt = f"{(r.tile_bytes or 0.0):,.0f}".rjust(bytes_w)
@@ -443,26 +717,47 @@ def run() -> int:
                         f"{paint(pcc_txt, color_pcc(r.pcc))}  "
                         f"{paint(mae_txt, color_err(r.mae))}  "
                         f"{paint(atol_txt, color_err(r.atol))}  "
+                        f"{time_txt}  "
+                        f"{gb_txt}  "
                         f"{counts_txt}  {bytes_txt}"
                     )
                     print(line)
                     table_lines.append(strip_ansi(line))
             else:
+                time_w = len("TIME(s)")
+                gb_w = len("GB")
+                pcc_w = len("PCC")
+                mae_w = len("MAE")
+                atol_w = len("ATOL")
+                for r in rows:
+                    time_w = max(time_w, len(f"{r.time_s:.3f}"))
+                    gb_w = max(gb_w, len(f"{r.gb:.3f}"))
+                    pcc_w = max(pcc_w, len(f"{r.pcc: .5f}"))
+                    mae_w = max(mae_w, len(f"{r.mae:.3e}"))
+                    atol_w = max(atol_w, len(f"{r.atol:.3e}"))
                 header = (
                     f"  {paint('COMP'.ljust(comp_w), 'muted')}  {paint('FORMAT'.ljust(fmt_w), 'muted')}  "
-                    f"{paint('PCC', 'muted')}      {paint('MAE', 'muted')}      {paint('ATOL', 'muted')}"
+                    f"{paint('PCC'.rjust(pcc_w), 'muted')}  "
+                    f"{paint('MAE'.rjust(mae_w), 'muted')}  "
+                    f"{paint('ATOL'.rjust(atol_w), 'muted')}  "
+                    f"{paint('TIME(s)'.rjust(time_w), 'muted')}  "
+                    f"{paint('GB'.rjust(gb_w), 'muted')}"
                 )
                 print(header)
                 table_lines.append(strip_ansi(header))
                 for r in rows:
-                    pcc_txt = f"{r.pcc: .5f}"
-                    mae_txt = f"{r.mae:.3e}"
-                    atol_txt = f"{r.atol:.3e}"
+                    pcc_txt = f"{r.pcc: .5f}".rjust(pcc_w)
+                    mae_txt = f"{r.mae:.3e}".rjust(mae_w)
+                    atol_txt = f"{r.atol:.3e}".rjust(atol_w)
+                    time_txt = f"{r.time_s:.3f}".rjust(time_w)
+                    gb_txt = f"{r.gb:.3f}".rjust(gb_w)
                     line = (
                         f"  {r.compression.ljust(comp_w)}  {r.fmt.ljust(fmt_w)}  "
                         f"{paint(pcc_txt, color_pcc(r.pcc))}  "
                         f"{paint(mae_txt, color_err(r.mae))}  "
-                        f"{paint(atol_txt, color_err(r.atol))}"
+                        f"{paint(atol_txt, color_err(r.atol))}  "
+                        f"{time_txt}  "
+                        f"{gb_txt}"
                     )
                     print(line)
                     table_lines.append(strip_ansi(line))
@@ -474,7 +769,7 @@ def run() -> int:
         print(paint("Summary (mean across matched tensors)", "title"))
         table_lines.append("Summary (mean across matched tensors)")
         for comp in compression_names:
-            if comp in {"mixed-tile-greedy", "mixed-tile-random"}:
+            if comp in {"mixed-tile-greedy", "mixed-tile-random", "mixed-tile-threshold"}:
                 fmt_list = ["MIXED"]
             else:
                 fmt_list = [fmt.upper() for fmt in formats]
