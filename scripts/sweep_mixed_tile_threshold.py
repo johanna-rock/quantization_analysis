@@ -193,6 +193,17 @@ def _rgb_from_point(point: dict) -> tuple[float, float, float]:
     return (r / norm, g / norm, b / norm)
 
 
+def _pad_limits(min_v: float, max_v: float, pad_frac: float = 0.03) -> tuple[float, float]:
+    span = max(max_v - min_v, 1e-9)
+    pad = span * pad_frac
+    return min_v - pad, max_v + pad
+
+
+def _lighten_color(color: tuple[float, float, float], amount: float) -> tuple[float, float, float]:
+    amount = min(max(amount, 0.0), 1.0)
+    return tuple(c + (1.0 - c) * amount for c in color)
+
+
 def _write_plot(
     out_path: Path,
     metric: str,
@@ -259,6 +270,8 @@ def _write_plot(
     ax.set_ylabel(metric.upper())
     ax.set_title(f"Size vs metric sweep — {tensor_name}")
     ax.grid(True, alpha=0.3)
+    ax.set_xlim(*_pad_limits(min(xs), max(xs)))
+    ax.set_ylim(*_pad_limits(min(ys), max(ys)))
 
     fmt_colors = {
         "bf16": (0.0, 1.0, 0.0),
@@ -279,6 +292,7 @@ def _write_plot(
 
 
 _LAYER_RE = re.compile(r"(?:^|.*\.)layers\.(\d+)\.(.+)$")
+_EXPERT_RE = re.compile(r"^(.*\bexperts)\.(\d+)\.(.+)$")
 
 
 def _split_layer_suffix(tensor_name: str) -> tuple[int | None, str]:
@@ -286,6 +300,14 @@ def _split_layer_suffix(tensor_name: str) -> tuple[int | None, str]:
     if not match:
         return None, tensor_name
     return int(match.group(1)), match.group(2)
+
+
+def _split_expert_suffix(suffix: str) -> tuple[str, int | None]:
+    match = _EXPERT_RE.match(suffix)
+    if not match:
+        return suffix, None
+    base = f"{match.group(1)}.{match.group(3)}"
+    return base, int(match.group(2))
 
 
 def _select_tensors(index, query: str, use_regex: bool) -> list[str]:
@@ -349,8 +371,19 @@ def _write_group_overlays(
 
     cmap = plt.get_cmap("Blues")
 
+    all_metric_points = []
+    for entries in grouped.values():
+        for entry in entries:
+            all_metric_points.extend(entry["points"])
+    for entries in baselines.values():
+        for entry in entries:
+            all_metric_points.extend(entry["points"])
+    global_min = min(p["metric"] for p in all_metric_points)
+    global_max = max(p["metric"] for p in all_metric_points)
     for ax, (group_name, lines) in zip(axes[0], groups):
+        baseline_lines = baselines.get(group_name, [])
         all_points = [p for line in lines for p in line["points"]]
+        all_points += [p for line in baseline_lines for p in line["points"]]
         if not all_points:
             ax.set_axis_off()
             continue
@@ -384,9 +417,34 @@ def _write_group_overlays(
                 color = cmap(t)
                 ax.plot(xs, ys, color=color, linewidth=1.5)
 
+        baseline_points = [p for line in baseline_lines for p in line["points"]]
+        for p in baseline_points:
+            x = p["size"] / scale
+            y = p["metric"]
+            color = _rgb_from_point(p)
+            ax.scatter([x], [y], color=color, marker="o", s=30, edgecolors="black", linewidths=0.4)
+
+        if baseline_lines:
+            first_points = baseline_lines[0]["points"]
+            for p in first_points:
+                x = p["size"] / scale
+                y = p["metric"]
+                ax.annotate(
+                    f"{p['label']} ({x:.2f}{unit})",
+                    (x, y),
+                    textcoords="offset points",
+                    xytext=(6, 0),
+                    ha="left",
+                    va="center",
+                    fontsize=6,
+                )
+
         ax.set_title(group_name)
         ax.set_xlabel(f"Size ({unit})")
         ax.grid(True, alpha=0.3)
+        ax.set_ylim(*_pad_limits(global_min, global_max))
+        x_vals = [p["size"] / scale for p in all_points]
+        ax.set_xlim(*_pad_limits(min(x_vals), max(x_vals)))
 
     axes[0][0].set_ylabel(metric.upper())
     fig.tight_layout()
@@ -426,8 +484,19 @@ def _write_layer_overlays(
         colors = [cmap(i / max(1, len(weight_names) - 1)) for i in range(len(weight_names))]
     weight_color = {name: colors[idx] for idx, name in enumerate(weight_names)}
 
+    all_metric_points = []
+    for entries in grouped.values():
+        for entry in entries:
+            all_metric_points.extend(entry["points"])
+    for entries in baselines.values():
+        for entry in entries:
+            all_metric_points.extend(entry["points"])
+    global_min = min(p["metric"] for p in all_metric_points)
+    global_max = max(p["metric"] for p in all_metric_points)
     for ax, (layer_id, lines) in zip(axes[0], layers):
+        baseline_lines = baselines.get(layer_id, [])
         all_points = [p for line in lines for p in line["points"]]
+        all_points += [p for line in baseline_lines for p in line["points"]]
         if not all_points:
             ax.set_axis_off()
             continue
@@ -443,15 +512,48 @@ def _write_layer_overlays(
             scale = 1e3
             unit = "KB"
 
+        expert_ids = [line["expert_id"] for line in lines if line.get("expert_id") is not None]
+        min_expert = min(expert_ids) if expert_ids else 0
+        max_expert = max(expert_ids) if expert_ids else 0
+        denom_expert = max(1, max_expert - min_expert)
+
         for line in sorted(lines, key=lambda l: l["weight_name"]):
             xs = [p["size"] / scale for p in line["points"]]
             ys = [p["metric"] for p in line["points"]]
             color = weight_color.get(line["weight_name"], (0.2, 0.2, 0.8))
+            if line.get("expert_id") is not None:
+                t = (line["expert_id"] - min_expert) / denom_expert if denom_expert else 0.0
+                color = _lighten_color(color, 0.6 * t)
             ax.plot(xs, ys, color=color, linewidth=1.5)
+
+        baseline_points = [p for line in baseline_lines for p in line["points"]]
+        for p in baseline_points:
+            x = p["size"] / scale
+            y = p["metric"]
+            color = _rgb_from_point(p)
+            ax.scatter([x], [y], color=color, marker="o", s=30, edgecolors="black", linewidths=0.4)
+
+        if baseline_lines:
+            first_points = baseline_lines[0]["points"]
+            for p in first_points:
+                x = p["size"] / scale
+                y = p["metric"]
+                ax.annotate(
+                    f"{p['label']} ({x:.2f}{unit})",
+                    (x, y),
+                    textcoords="offset points",
+                    xytext=(6, 0),
+                    ha="left",
+                    va="center",
+                    fontsize=6,
+                )
 
         ax.set_title(f"Layer {layer_id}")
         ax.set_xlabel(f"Size ({unit})")
         ax.grid(True, alpha=0.3)
+        ax.set_ylim(*_pad_limits(global_min, global_max))
+        x_vals = [p["size"] / scale for p in all_points]
+        ax.set_xlim(*_pad_limits(min(x_vals), max(x_vals)))
 
     axes[0][0].set_ylabel(metric.upper())
 
@@ -462,7 +564,7 @@ def _write_layer_overlays(
         handles=legend_handles,
         loc="upper center",
         bbox_to_anchor=(0.5, 1.02),
-        ncol=min(4, len(weight_names)),
+        ncol=min(4, len(legend_handles)),
         fontsize=8,
     )
     fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.95))
@@ -692,22 +794,24 @@ def main() -> int:
         _write_plot(out_path / "size_vs_metric.png", args.metric, plot_points, formats, tensor_name)
 
         layer_id, group_name = _split_layer_suffix(tensor_name)
+        group_base, expert_id = _split_expert_suffix(group_name)
+        group_key = group_base if expert_id is not None else group_name
         pareto_points = _pareto_frontier(plot_points, args.metric)
         if pareto_points:
-            grouped_lines.setdefault(group_name, []).append(
-                {"layer_id": layer_id, "points": pareto_points}
+            grouped_lines.setdefault(group_key, []).append(
+                {"layer_id": layer_id, "points": pareto_points, "expert_id": expert_id}
             )
             if layer_id is not None:
                 grouped_by_layer.setdefault(layer_id, []).append(
-                    {"weight_name": group_name, "points": pareto_points}
+                    {"weight_name": group_key, "points": pareto_points, "expert_id": expert_id}
                 )
         if baseline_points:
-            grouped_baselines.setdefault(group_name, []).append(
-                {"layer_id": layer_id, "points": baseline_points}
+            grouped_baselines.setdefault(group_key, []).append(
+                {"layer_id": layer_id, "points": baseline_points, "expert_id": expert_id}
             )
             if layer_id is not None:
                 grouped_baselines_by_layer.setdefault(layer_id, []).append(
-                    {"weight_name": group_name, "points": baseline_points}
+                    {"weight_name": group_key, "points": baseline_points, "expert_id": expert_id}
                 )
 
     if grouped_lines:
