@@ -170,7 +170,10 @@ def _rgb_from_point(point: dict) -> tuple[float, float, float]:
     r = float(point.get("bfp2_tiles", 0.0)) / total
     b = float(point.get("bfp4_tiles", 0.0)) / total
     g = (float(point.get("bfp8_tiles", 0.0)) + float(point.get("bf16_tiles", 0.0))) / total
-    return (r, g, b)
+    gamma = 0.5
+    r, g, b = (r ** gamma, g ** gamma, b ** gamma)
+    norm = max(1e-8, r + g + b)
+    return (r / norm, g / norm, b / norm)
 
 
 def _write_plot(
@@ -246,9 +249,7 @@ def _write_plot(
         "bfp4": (0.0, 0.0, 1.0),
         "bfp2": (1.0, 0.0, 0.0),
     }
-    legend_elements = [
-        Line2D([0], [0], marker="o", color="black", label="Pareto frontier", markerfacecolor="black", markersize=6),
-    ]
+    legend_elements = []
     for fmt in formats:
         color = fmt_colors.get(fmt, (0.2, 0.2, 0.8))
         legend_elements.append(
@@ -319,10 +320,10 @@ def _write_group_overlays(
     ncols = len(groups)
     fig, axes = plt.subplots(1, ncols, figsize=(max(6.0, 4.0 * ncols), 4.5), squeeze=False)
 
+    cmap = plt.get_cmap("Blues")
+
     for ax, (group_name, lines) in zip(axes[0], groups):
-        baseline_lines = baselines.get(group_name, [])
         all_points = [p for line in lines for p in line["points"]]
-        all_points += [p for line in baseline_lines for p in line["points"]]
         if not all_points:
             ax.set_axis_off()
             continue
@@ -338,51 +339,23 @@ def _write_group_overlays(
             scale = 1e3
             unit = "KB"
 
+        layer_ids = [line["layer_id"] for line in lines if line["layer_id"] is not None]
+        min_id = min(layer_ids) if layer_ids else 0
+        max_id = max(layer_ids) if layer_ids else 0
+        denom = max(1, max_id - min_id)
+
         for line in sorted(lines, key=lambda l: (l["layer_id"] is None, l["layer_id"])):
             xs = [p["size"] / scale for p in line["points"]]
             ys = [p["metric"] for p in line["points"]]
             point_colors = [_rgb_from_point(p) for p in line["points"]]
             if len(xs) > 1:
-                segments = [
-                    [(xs[i], ys[i]), (xs[i + 1], ys[i + 1])]
-                    for i in range(len(xs) - 1)
-                ]
-                seg_colors = [
-                    tuple(
-                        (point_colors[i][c] + point_colors[i + 1][c]) / 2.0
-                        for c in range(3)
-                    )
-                    for i in range(len(point_colors) - 1)
-                ]
-                lc = LineCollection(segments, colors=seg_colors, linewidths=1.5)
-                ax.add_collection(lc)
-            ax.scatter(xs, ys, color=point_colors, s=15)
-
-        baseline_points = [p for line in baseline_lines for p in line["points"]]
-        for p in baseline_points:
-            x = p["size"] / scale
-            y = p["metric"]
-            color = _rgb_from_point(p)
-            ax.scatter([x], [y], color=color, marker="o", s=30, edgecolors="black", linewidths=0.4)
-
-        if baseline_points:
-            by_label: dict[str, list[dict]] = {}
-            for p in baseline_points:
-                by_label.setdefault(p["label"], []).append(p)
-            for label, pts in by_label.items():
-                if metric == "pcc":
-                    chosen = max(pts, key=lambda v: v["metric"])
+                layer_id = line["layer_id"]
+                if layer_id is None:
+                    t = 0.5
                 else:
-                    chosen = min(pts, key=lambda v: v["metric"])
-                x = chosen["size"] / scale
-                y = chosen["metric"]
-                ax.annotate(
-                    f"{label} ({x:.2f}{unit})",
-                    (x, y),
-                    textcoords="offset points",
-                    xytext=(4, 4),
-                    fontsize=6,
-                )
+                    t = 0.9 - 0.8 * ((layer_id - min_id) / denom)
+                color = cmap(t)
+                ax.plot(xs, ys, color=color, linewidth=1.5)
 
         ax.set_title(group_name)
         ax.set_xlabel(f"Size ({unit})")
@@ -407,7 +380,7 @@ def _write_layer_overlays(
 
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
-        from matplotlib.collections import LineCollection
+        from matplotlib.lines import Line2D
     except Exception:
         return
 
@@ -415,10 +388,19 @@ def _write_layer_overlays(
     ncols = len(layers)
     fig, axes = plt.subplots(1, ncols, figsize=(max(6.0, 4.0 * ncols), 4.5), squeeze=False)
 
+    weight_names = sorted({line["weight_name"] for lines in grouped.values() for line in lines})
+    if not weight_names:
+        return
+    if len(weight_names) <= 20:
+        cmap = plt.get_cmap("tab20")
+        colors = [cmap(i) for i in range(len(weight_names))]
+    else:
+        cmap = plt.get_cmap("hsv")
+        colors = [cmap(i / max(1, len(weight_names) - 1)) for i in range(len(weight_names))]
+    weight_color = {name: colors[idx] for idx, name in enumerate(weight_names)}
+
     for ax, (layer_id, lines) in zip(axes[0], layers):
-        baseline_lines = baselines.get(layer_id, [])
         all_points = [p for line in lines for p in line["points"]]
-        all_points += [p for line in baseline_lines for p in line["points"]]
         if not all_points:
             ax.set_axis_off()
             continue
@@ -437,43 +419,26 @@ def _write_layer_overlays(
         for line in sorted(lines, key=lambda l: l["weight_name"]):
             xs = [p["size"] / scale for p in line["points"]]
             ys = [p["metric"] for p in line["points"]]
-            point_colors = [_rgb_from_point(p) for p in line["points"]]
-            if len(xs) > 1:
-                segments = [
-                    [(xs[i], ys[i]), (xs[i + 1], ys[i + 1])]
-                    for i in range(len(xs) - 1)
-                ]
-                seg_colors = [
-                    tuple(
-                        (point_colors[i][c] + point_colors[i + 1][c]) / 2.0
-                        for c in range(3)
-                    )
-                    for i in range(len(point_colors) - 1)
-                ]
-                lc = LineCollection(segments, colors=seg_colors, linewidths=1.5)
-                ax.add_collection(lc)
-            ax.scatter(xs, ys, color=point_colors, s=15)
-
-        for baseline in baseline_lines:
-            for p in baseline["points"]:
-                x = p["size"] / scale
-                y = p["metric"]
-                color = _rgb_from_point(p)
-                ax.scatter([x], [y], color=color, marker="o", s=30, edgecolors="black", linewidths=0.4)
-                ax.annotate(
-                    f"{p['label']} ({x:.2f}{unit})",
-                    (x, y),
-                    textcoords="offset points",
-                    xytext=(4, 4),
-                    fontsize=6,
-                )
+            color = weight_color.get(line["weight_name"], (0.2, 0.2, 0.8))
+            ax.plot(xs, ys, color=color, linewidth=1.5)
 
         ax.set_title(f"Layer {layer_id}")
         ax.set_xlabel(f"Size ({unit})")
         ax.grid(True, alpha=0.3)
 
     axes[0][0].set_ylabel(metric.upper())
-    fig.tight_layout()
+
+    legend_handles = [
+        Line2D([0], [0], color=weight_color[name], lw=2, label=name) for name in weight_names
+    ]
+    fig.legend(
+        handles=legend_handles,
+        loc="upper center",
+        bbox_to_anchor=(0.5, 1.02),
+        ncol=min(4, len(weight_names)),
+        fontsize=8,
+    )
+    fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.95))
     fig.savefig(out_path, dpi=160)
     plt.close(fig)
 
