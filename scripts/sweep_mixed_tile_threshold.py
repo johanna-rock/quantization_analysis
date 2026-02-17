@@ -85,14 +85,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--lowest-metric-val",
         type=float,
-        required=True,
+        default=0.9,
         help="Lowest metric value to sweep to (pcc: lower bound, mae/atol: upper bound).",
     )
     parser.add_argument(
         "--steps",
         type=int,
-        default=100,
-        help="Number of threshold steps including endpoints (default: 100).",
+        default=50,
+        help="Number of threshold steps including endpoints (default: 50).",
     )
     parser.add_argument(
         "--out-dir",
