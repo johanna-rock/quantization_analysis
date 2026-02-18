@@ -55,7 +55,10 @@ def load_compression_config(path: str | None) -> CompressionConfig:
             try:
                 seed = int(seed_value)
             except (TypeError, ValueError) as exc:
-                raise ValueError("Compression config 'seed' must be an int or 'random'") from exc
+                raise ValueError("Compression config 'seed' must be an int, 0, or 'random'") from exc
+            if seed == 0:
+                random_seed = True
+                seed = None
 
     return CompressionConfig(
         algorithm=algorithm,

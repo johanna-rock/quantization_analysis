@@ -12,6 +12,7 @@
 ## DeepSeek-R1 common regex
 - Attention weights (broad): `^model\.layers\.\d+\.self_attn\..*weight$`
 - Attention weights (q/k/v/o only): `^model\.layers\.\d+\.self_attn\.(q_proj|k_proj|v_proj|o_proj)\.weight$`
+- MLP weights: `^model\.layers\.\d+\.mlp\.(down_proj|up_proj|gate_proj)\.weight$`
 - Embedding + lm_head: `^(model\.embed_tokens\.weight|lm_head\.weight)$`
 
 ## Example (list matches)

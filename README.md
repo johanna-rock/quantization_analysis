@@ -76,19 +76,16 @@ Example compression config (`compression_configs/compression_config.mixed_tile_g
 {
   "algorithm": "mixed-tile-greedy",
   "quantization_formats": [
-    "mxfp4",
-    "nvfp4",
     "bf16",
     "bfp8",
     "bfp4",
     "bfp2",
     "fp0"
   ],
+  "seed": 0,
   "params": {
     "metric": "pcc",
-    "threshold": 0.999,
-    "cluster": "kmeans",
-    "k": 10
+    "threshold": 0.999
   }
 }
 ```
@@ -97,7 +94,7 @@ Supported algorithms: `none`, `transpose`, `mixed-tile-greedy`, `mixed-tile-thre
 If `quantization_formats` is omitted, all formats are used by default.
 For mixed-tile algorithms, `quantization_formats` is intersected with `bf16,bfp8,bfp4,bfp2`.
 When a config is provided, `wq` runs the selected algorithm alongside the `none` baseline.
-Optional `seed` can be an integer or the string `random`; the used seed is recorded in `compression_config.used.json`.
+Optional `seed` can be an integer, `0` (random each run), or the string `random`; the used seed is recorded in `compression_config.used.json`.
 
 Other example configs:
 - `compression_configs/compression_config.transpose.example.json`

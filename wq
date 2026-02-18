@@ -283,19 +283,24 @@ def _write_tile_assignment_plot(
     plt.close(fig)
 
 
-def _mixed_tile_threshold_dir(out_dir: Path, tensor_name: str) -> Path:
+def _mixed_tile_dir(out_dir: Path, algo_dir: str, tensor_name: str) -> Path:
     slug = _slug(tensor_name)
-    return out_dir / "mixed_tile_threshold" / slug
+    return out_dir / algo_dir / slug
 
 
-def _write_mixed_tile_threshold_outputs(
+def _mixed_tile_threshold_dir(out_dir: Path, tensor_name: str) -> Path:
+    return _mixed_tile_dir(out_dir, "mixed_tile_threshold", tensor_name)
+
+
+def _write_mixed_tile_assignment_outputs(
     out_dir: Path,
     tensor_name: str,
     assignment: np.ndarray | None,
+    algo_dir: str,
 ) -> None:
     if assignment is None:
         return
-    mt_dir = _mixed_tile_threshold_dir(out_dir, tensor_name)
+    mt_dir = _mixed_tile_dir(out_dir, algo_dir, tensor_name)
     mt_dir.mkdir(parents=True, exist_ok=True)
     assign_path = mt_dir / "assignment.npy"
     np.save(assign_path, assignment.astype(np.int8))
@@ -311,12 +316,29 @@ def _write_mixed_tile_threshold_outputs(
     _write_tile_assignment_plot(mt_dir, tensor_name, assignment)
 
 
-def _write_mixed_tile_threshold_size_plot(
+def _write_mixed_tile_threshold_outputs(
+    out_dir: Path,
+    tensor_name: str,
+    assignment: np.ndarray | None,
+) -> None:
+    _write_mixed_tile_assignment_outputs(out_dir, tensor_name, assignment, "mixed_tile_threshold")
+
+
+def _write_mixed_tile_greedy_outputs(
+    out_dir: Path,
+    tensor_name: str,
+    assignment: np.ndarray | None,
+) -> None:
+    _write_mixed_tile_assignment_outputs(out_dir, tensor_name, assignment, "mixed_tile_greedy")
+
+
+def _write_mixed_tile_size_plot(
     out_dir: Path,
     tensor_name: str,
     metric_name: str,
     points: list[dict],
     formats: list[str],
+    algo_dir: str,
 ) -> None:
     if not points:
         return
@@ -385,10 +407,81 @@ def _write_mixed_tile_threshold_size_plot(
         ax.legend(handles=legend_elements, loc="best", fontsize=8)
     fig.tight_layout()
 
-    mt_dir = _mixed_tile_threshold_dir(out_dir, tensor_name)
+    mt_dir = _mixed_tile_dir(out_dir, algo_dir, tensor_name)
     mt_dir.mkdir(parents=True, exist_ok=True)
     fig.savefig(mt_dir / "size_vs_accuracy.png", dpi=160)
     plt.close(fig)
+
+
+def _write_mixed_tile_threshold_size_plot(
+    out_dir: Path,
+    tensor_name: str,
+    metric_name: str,
+    points: list[dict],
+    formats: list[str],
+) -> None:
+    _write_mixed_tile_size_plot(out_dir, tensor_name, metric_name, points, formats, "mixed_tile_threshold")
+
+
+def _write_mixed_tile_greedy_size_plot(
+    out_dir: Path,
+    tensor_name: str,
+    metric_name: str,
+    points: list[dict],
+    formats: list[str],
+) -> None:
+    _write_mixed_tile_size_plot(out_dir, tensor_name, metric_name, points, formats, "mixed_tile_greedy")
+
+
+def _emit_mixed_tile_size_plot(
+    out_dir: Path,
+    tensor_name: str,
+    metric_name: str,
+    rows_by_comp: dict[str, list[Row]],
+    algo_name: str,
+) -> None:
+    if algo_name not in rows_by_comp:
+        return
+    points: list[dict] = []
+    total_tiles = None
+    for r in rows_by_comp.get(algo_name, []):
+        if r.tile_counts:
+            total_tiles = sum(r.tile_counts.values())
+            break
+    for r in rows_by_comp.get("none", []):
+        metric_value = r.pcc if metric_name == "pcc" else (r.mae if metric_name == "mae" else r.atol)
+        baseline_counts = {fmt: 0 for fmt in MIXED_TILE_FORMATS}
+        fmt_key = r.fmt.lower()
+        if total_tiles is not None and fmt_key in baseline_counts:
+            baseline_counts[fmt_key] = total_tiles
+        points.append(
+            {
+                "label": r.fmt.upper(),
+                "bytes": r.gb * 1e9,
+                "metric": metric_value,
+                "kind": "baseline",
+                **{f"{fmt}_tiles": baseline_counts.get(fmt, 0) for fmt in MIXED_TILE_FORMATS},
+            }
+        )
+    for r in rows_by_comp.get(algo_name, []):
+        metric_value = r.pcc if metric_name == "pcc" else (r.mae if metric_name == "mae" else r.atol)
+        mixed_counts = {fmt: 0 for fmt in MIXED_TILE_FORMATS}
+        if r.tile_counts:
+            for fmt in MIXED_TILE_FORMATS:
+                mixed_counts[fmt] = r.tile_counts.get(fmt, 0)
+        points.append(
+            {
+                "label": "MIXED",
+                "bytes": r.gb * 1e9,
+                "metric": metric_value,
+                "kind": "mixed",
+                **{f"{fmt}_tiles": mixed_counts.get(fmt, 0) for fmt in MIXED_TILE_FORMATS},
+            }
+        )
+    if algo_name == "mixed-tile-greedy":
+        _write_mixed_tile_greedy_size_plot(out_dir, tensor_name, metric_name, points, MIXED_TILE_FORMATS)
+    else:
+        _write_mixed_tile_threshold_size_plot(out_dir, tensor_name, metric_name, points, MIXED_TILE_FORMATS)
 
 
 @dataclass
@@ -460,20 +553,37 @@ def run() -> int:
     config = load_compression_config(args.compression_config)
     algo_params = dict(config.params)
     seed_source = None
+    used_seed = None
     if config.seed is not None:
-        used_seed = config.seed
-        seed_source = "config"
+        config_seed = int(config.seed)
+        if config_seed == 0:
+            used_seed = secrets.randbits(31)
+            seed_source = "random"
+        else:
+            used_seed = config_seed
+            seed_source = "config"
     elif config.random_seed:
         used_seed = secrets.randbits(31)
         seed_source = "random"
-    else:
-        used_seed = None
 
     if used_seed is not None:
         algo_params["seed"] = used_seed
     elif "seed" in algo_params:
-        used_seed = algo_params["seed"]
-        seed_source = "params"
+        param_seed = algo_params["seed"]
+        try:
+            param_seed_int = int(param_seed)
+        except (TypeError, ValueError):
+            used_seed = param_seed
+            seed_source = "params"
+        else:
+            if param_seed_int == 0:
+                used_seed = secrets.randbits(31)
+                algo_params["seed"] = used_seed
+                seed_source = "random"
+            else:
+                used_seed = param_seed_int
+                algo_params["seed"] = used_seed
+                seed_source = "params"
 
     selected_algo = create_algorithm(config.algorithm, algo_params)
     baseline = create_algorithm("none", {})
@@ -620,51 +730,24 @@ def run() -> int:
                         _write_mixed_tile_threshold_outputs(
                             results_dir, tensor_name, assignment
                         )
+                if (
+                    res.compression == "mixed-tile-greedy"
+                    and res.meta
+                    and results_dir is not None
+                ):
+                    assignment = res.meta.get("assignment")
+                    if isinstance(assignment, np.ndarray):
+                        _write_mixed_tile_greedy_outputs(
+                            results_dir, tensor_name, assignment
+                        )
 
         if (
             results_dir is not None
-            and selected_algo.name == "mixed-tile-threshold"
-            and "mixed-tile-threshold" in rows_by_comp
+            and selected_algo.name in {"mixed-tile-threshold", "mixed-tile-greedy"}
         ):
             metric_name = algo_params.get("metric", "pcc")
-            points: list[dict] = []
-            total_tiles = None
-            for r in rows_by_comp.get("mixed-tile-threshold", []):
-                if r.tile_counts:
-                    total_tiles = sum(r.tile_counts.values())
-                    break
-            for r in rows_by_comp.get("none", []):
-                metric_value = r.pcc if metric_name == "pcc" else (r.mae if metric_name == "mae" else r.atol)
-                baseline_counts = {fmt: 0 for fmt in MIXED_TILE_FORMATS}
-                fmt_key = r.fmt.lower()
-                if total_tiles is not None and fmt_key in baseline_counts:
-                    baseline_counts[fmt_key] = total_tiles
-                points.append(
-                    {
-                        "label": r.fmt.upper(),
-                        "bytes": r.gb * 1e9,
-                        "metric": metric_value,
-                        "kind": "baseline",
-                        **{f"{fmt}_tiles": baseline_counts.get(fmt, 0) for fmt in MIXED_TILE_FORMATS},
-                    }
-                )
-            for r in rows_by_comp.get("mixed-tile-threshold", []):
-                metric_value = r.pcc if metric_name == "pcc" else (r.mae if metric_name == "mae" else r.atol)
-                mixed_counts = {fmt: 0 for fmt in MIXED_TILE_FORMATS}
-                if r.tile_counts:
-                    for fmt in MIXED_TILE_FORMATS:
-                        mixed_counts[fmt] = r.tile_counts.get(fmt, 0)
-                points.append(
-                    {
-                        "label": "MIXED",
-                        "bytes": r.gb * 1e9,
-                        "metric": metric_value,
-                        "kind": "mixed",
-                        **{f"{fmt}_tiles": mixed_counts.get(fmt, 0) for fmt in MIXED_TILE_FORMATS},
-                    }
-                )
-            _write_mixed_tile_threshold_size_plot(
-                results_dir, tensor_name, metric_name, points, MIXED_TILE_FORMATS
+            _emit_mixed_tile_size_plot(
+                results_dir, tensor_name, metric_name, rows_by_comp, selected_algo.name
             )
 
         for comp in compression_names:

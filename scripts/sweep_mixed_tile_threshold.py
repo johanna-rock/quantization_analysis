@@ -353,6 +353,7 @@ def _write_group_overlays(
     metric: str,
     grouped: dict[str, list[dict]],
     baselines: dict[str, list[dict]],
+    metric_floor: float | None = None,
 ) -> None:
     if not grouped:
         return
@@ -380,6 +381,8 @@ def _write_group_overlays(
             all_metric_points.extend(entry["points"])
     global_min = min(p["metric"] for p in all_metric_points)
     global_max = max(p["metric"] for p in all_metric_points)
+    if metric == "pcc" and metric_floor is not None:
+        global_min = metric_floor
     for ax, (group_name, lines) in zip(axes[0], groups):
         baseline_lines = baselines.get(group_name, [])
         all_points = [p for line in lines for p in line["points"]]
@@ -457,6 +460,7 @@ def _write_layer_overlays(
     metric: str,
     grouped: dict[int, list[dict]],
     baselines: dict[int, list[dict]],
+    metric_floor: float | None = None,
 ) -> None:
     if not grouped:
         return
@@ -493,6 +497,8 @@ def _write_layer_overlays(
             all_metric_points.extend(entry["points"])
     global_min = min(p["metric"] for p in all_metric_points)
     global_max = max(p["metric"] for p in all_metric_points)
+    if metric == "pcc" and metric_floor is not None:
+        global_min = metric_floor
     for ax, (layer_id, lines) in zip(axes[0], layers):
         baseline_lines = baselines.get(layer_id, [])
         all_points = [p for line in lines for p in line["points"]]
@@ -820,6 +826,7 @@ def main() -> int:
             args.metric,
             grouped_lines,
             grouped_baselines,
+            metric_floor=args.lowest_metric_val if args.metric == "pcc" else None,
         )
     if grouped_by_layer:
         _write_layer_overlays(
@@ -827,6 +834,7 @@ def main() -> int:
             args.metric,
             grouped_by_layer,
             grouped_baselines_by_layer,
+            metric_floor=args.lowest_metric_val if args.metric == "pcc" else None,
         )
 
     print(f"Wrote sweep results to {base_out}")

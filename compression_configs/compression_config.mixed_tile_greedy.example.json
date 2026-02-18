@@ -7,10 +7,9 @@
     "bfp2",
     "fp0"
   ],
+  "seed": 0,
   "params": {
     "metric": "pcc",
-    "threshold": 0.999,
-    "cluster": "kmeans",
-    "k": 100
+    "threshold": 0.999
   }
 }
